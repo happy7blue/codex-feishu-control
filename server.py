@@ -396,6 +396,7 @@ class TaskManager:
         self._finish_lock = threading.Lock()
         self._pending_finished: Dict[str, List[Dict[str, Any]]] = {}
         self._finish_timers: Dict[str, threading.Timer] = {}
+        self._finish_timer_versions: Dict[str, int] = {}
         self._queue_lock = threading.Lock()
         self.pending_queue: List[Dict[str, Any]] = []
         self._queue_processing = False
@@ -919,7 +920,7 @@ class TaskManager:
         self._process_pending_queue_async()
 
     def _queue_finished_notification(self, task_id: str, meta: Dict[str, Any]) -> None:
-        chat_id = meta.get("chat_id")
+        chat_id = str(meta.get("chat_id") or "").strip()
         if not chat_id:
             return
         window = max(0, int(self.config.finish_summary_window))
@@ -933,17 +934,23 @@ class TaskManager:
                     "meta": dict(meta),
                 }
             )
-            if chat_id in self._finish_timers:
-                return
-            timer = threading.Timer(window, self._flush_finished_notifications, args=(chat_id,))
+            existing_timer = self._finish_timers.get(chat_id)
+            if existing_timer:
+                existing_timer.cancel()
+            version = self._finish_timer_versions.get(chat_id, 0) + 1
+            self._finish_timer_versions[chat_id] = version
+            timer = threading.Timer(window, self._flush_finished_notifications, args=(chat_id, version))
             timer.daemon = True
             self._finish_timers[chat_id] = timer
             timer.start()
 
-    def _flush_finished_notifications(self, chat_id: str) -> None:
+    def _flush_finished_notifications(self, chat_id: str, version: Optional[int] = None) -> None:
         with self._finish_lock:
+            if version is not None and self._finish_timer_versions.get(chat_id) != version:
+                return
             entries = self._pending_finished.pop(chat_id, [])
             self._finish_timers.pop(chat_id, None)
+            self._finish_timer_versions.pop(chat_id, None)
         if not entries:
             return
         if len(entries) == 1:
@@ -1456,6 +1463,7 @@ def run_http(config: Config) -> None:
     print(f"Codex 飞书控制服务已启动: http://{config.host}:{config.port}", flush=True)
     print(f"配置文件: {config.config_path}", flush=True)
     print(f"任务目录: {config.tasks_root}", flush=True)
+    print(f"完成通知合并窗口: {config.finish_summary_window} 秒", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -1498,6 +1506,7 @@ def run_websocket(config: Config) -> None:
     print(f"App ID: {app_id}", flush=True)
     print(f"配置文件: {config.config_path}", flush=True)
     print(f"任务目录: {config.tasks_root}", flush=True)
+    print(f"完成通知合并窗口: {config.finish_summary_window} 秒", flush=True)
     client.start()
 
 
