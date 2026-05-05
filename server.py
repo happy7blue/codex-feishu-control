@@ -117,6 +117,13 @@ def parse_utc_timestamp(value: str) -> Optional[dt.datetime]:
     return parsed.astimezone(dt.timezone.utc)
 
 
+def format_local_timestamp(value: str) -> str:
+    parsed = parse_utc_timestamp(value)
+    if parsed:
+        return parsed.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    return dt.datetime.now().astimezone().replace(microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def snapshot_similar(current: str, previous: str) -> bool:
     if current == previous:
         return True
@@ -946,7 +953,11 @@ class TaskManager:
         self._notify_finished_batch(chat_id, entries)
 
     def _notify_finished_batch(self, chat_id: str, entries: List[Dict[str, Any]]) -> None:
-        lines = [f"【任务批量完成】共 {len(entries)} 个任务"]
+        latest_meta = entries[-1]["meta"]
+        lines = [
+            f"【任务批量完成】共 {len(entries)} 个任务",
+            f"时间：{self._finished_time(latest_meta)}",
+        ]
         for entry in entries:
             lines.append(self._format_finished_batch_line(entry["task_id"], entry["meta"]))
         text = "\n".join(lines)
@@ -959,16 +970,18 @@ class TaskManager:
     def _format_finished_batch_line(self, task_id: str, meta: Dict[str, Any]) -> str:
         alias = meta.get("project_alias") or "-"
         status = meta.get("status")
+        task_text = self._task_description(meta, 50)
+        task_suffix = f" · {task_text}" if task_text else ""
         if status == STATUS_SUCCEEDED:
-            return f"✅ {task_id} {alias} — 成功"
+            return f"✅ {task_id} {alias} — 成功{task_suffix}"
         if status == STATUS_FAILED:
             error = compact_line(meta.get("error") or "未知错误", 140)
-            return f"❌ {task_id} {alias} — 失败：{error}"
+            return f"❌ {task_id} {alias} — 失败：{error}{task_suffix}"
         if status == STATUS_TIMEOUT:
-            return f"⏱ {task_id} {alias} — 超时"
+            return f"⏱ {task_id} {alias} — 超时{task_suffix}"
         if status == STATUS_STOPPED:
-            return f"🛑 {task_id} {alias} — 已停止"
-        return f"{task_id} {alias} — {status or '已结束'}"
+            return f"🛑 {task_id} {alias} — 已停止{task_suffix}"
+        return f"{task_id} {alias} — {status or '已结束'}{task_suffix}"
 
     def _notify_finished(self, task_id: str, meta: Dict[str, Any]) -> None:
         chat_id = meta.get("chat_id")
@@ -985,7 +998,9 @@ class TaskManager:
         minutes = self._finished_minutes(meta)
         text = (
             f"【{title}】\n"
+            f"时间：{self._finished_time(meta)}\n"
             f"项目：{meta.get('project_alias')}\n"
+            f"任务：{self._task_description(meta, 100) or '未记录'}\n"
             f"耗时：约 {minutes} 分钟\n"
             f"结果：{meta.get('status')}\n"
             f"摘要：{summary}"
@@ -1003,6 +1018,12 @@ class TaskManager:
         if log_tail:
             return compact(log_tail, 300)
         return "无输出"
+
+    def _finished_time(self, meta: Dict[str, Any]) -> str:
+        return format_local_timestamp(str(meta.get("finished_at") or ""))
+
+    def _task_description(self, meta: Dict[str, Any], limit: int) -> str:
+        return compact_line(str(meta.get("prompt") or "").strip(), limit)
 
     def _finished_minutes(self, meta: Dict[str, Any]) -> int:
         created_at = parse_utc_timestamp(str(meta.get("created_at") or ""))
