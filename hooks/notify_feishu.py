@@ -29,6 +29,8 @@ DEFAULT_FEISHU_API_BASE = "https://open.feishu.cn/open-apis"
 DEFAULT_STOP_MIN_INTERVAL_SECONDS = 10
 DEFAULT_ROOT_STOP_DUPLICATE_WINDOW_SECONDS = 10
 DEFAULT_TOOL_FAILURE_MIN_INTERVAL_SECONDS = 300
+DEFAULT_STOP_SETTLE_SECONDS = 2
+DEFAULT_STOP_COMPLETION_LOOKBACK_SECONDS = 5
 
 
 def now_local() -> str:
@@ -40,6 +42,18 @@ def compact_line(text: str, limit: int = 120) -> str:
     if len(text) <= limit:
         return text
     return text[: max(0, limit - 3)] + "..."
+
+
+def timestamp_to_epoch(value: str) -> float:
+    if not value:
+        return 0.0
+    try:
+        parsed = _dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return 0.0
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_dt.timezone.utc)
+    return parsed.timestamp()
 
 
 def extract_content_text(content) -> str:
@@ -187,6 +201,85 @@ def latest_prompt_history_task() -> str:
     except Exception as exc:
         write_log("debug", "failed to read latest prompt history", error=str(exc))
     return ""
+
+
+def completion_message_from_transcript(path_value: str, since_epoch: float) -> str:
+    if not path_value:
+        return ""
+    try:
+        path = Path(path_value).expanduser().resolve()
+        codex_home = CODEX_HOME.expanduser().resolve()
+        if codex_home not in path.parents and path != codex_home:
+            return ""
+        if not path.exists() or not path.is_file():
+            return ""
+        max_bytes = 1024 * 1024
+        with path.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - max_bytes), os.SEEK_SET)
+            raw = fh.read().decode("utf-8", errors="replace")
+        for line in reversed(raw.splitlines()):
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            payload = row.get("payload") if isinstance(row, dict) else None
+            if not isinstance(payload, dict):
+                continue
+            payload_type = payload.get("type")
+            row_epoch = timestamp_to_epoch(str(row.get("timestamp") or ""))
+            if payload_type == "task_complete":
+                completed_at = payload.get("completed_at")
+                if isinstance(completed_at, (int, float)):
+                    completed_epoch = float(completed_at)
+                else:
+                    completed_epoch = row_epoch
+                if completed_epoch >= since_epoch:
+                    return str(payload.get("last_agent_message") or "").strip()
+                return ""
+            if payload_type == "agent_message" and payload.get("phase") == "final_answer":
+                if row_epoch >= since_epoch:
+                    return str(payload.get("message") or "").strip()
+    except Exception as exc:
+        write_log("debug", "failed to read transcript completion evidence", error=str(exc))
+    return ""
+
+
+def recent_completion_message(since_epoch: float) -> str:
+    sessions_dir = CODEX_HOME / "sessions"
+    if not sessions_dir.exists():
+        return ""
+    try:
+        candidates = []
+        for path in sessions_dir.rglob("*.jsonl"):
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            if mtime >= since_epoch - 300:
+                candidates.append((mtime, path))
+        candidates.sort(reverse=True)
+        for _, path in candidates[:30]:
+            message = completion_message_from_transcript(str(path), since_epoch)
+            if message:
+                return message
+    except Exception as exc:
+        write_log("debug", "failed to scan recent completion evidence", error=str(exc))
+    return ""
+
+
+def completion_evidence_message(data: dict, since_epoch: float) -> str:
+    message = str(data.get("last_assistant_message") or "").strip()
+    if message:
+        return message
+
+    transcript = data.get("transcript_path") or data.get("transcript")
+    message = completion_message_from_transcript(transcript, since_epoch) if isinstance(transcript, str) else ""
+    if message:
+        return message
+
+    return recent_completion_message(since_epoch)
 
 
 def task_description(data: dict, limit: int = 100) -> str:
@@ -512,6 +605,32 @@ def should_skip_notification(data: dict, title: str, reason: str, env_values: di
         return False, ""
 
 
+def should_skip_premature_stop(data: dict, env_values: dict, hook_started_at: float) -> tuple[bool, str]:
+    settle_seconds = int_config(
+        env_values,
+        "FEISHU_STOP_SETTLE_SECONDS",
+        DEFAULT_STOP_SETTLE_SECONDS,
+        0,
+        20,
+    )
+    if settle_seconds > 0:
+        time.sleep(settle_seconds)
+
+    lookback_seconds = int_config(
+        env_values,
+        "FEISHU_STOP_COMPLETION_LOOKBACK_SECONDS",
+        DEFAULT_STOP_COMPLETION_LOOKBACK_SECONDS,
+        0,
+        300,
+    )
+    message = completion_evidence_message(data, hook_started_at - lookback_seconds)
+    if message:
+        if not data.get("last_assistant_message"):
+            data["last_assistant_message"] = message
+        return False, ""
+    return True, "skip premature Stop notification without completion evidence"
+
+
 def concise_cwd(cwd: str) -> str:
     if not cwd or cwd == "-":
         return "-"
@@ -734,12 +853,19 @@ def send_notification(text: str, env_values: dict) -> tuple[bool, str]:
 
 
 def main() -> int:
+    hook_started_at = time.time()
     data = read_stdin_json()
     should_notify, title, reason = describe_event(data)
     event = data.get("hook_event_name") or "Unknown"
     env_values = load_env_file(ENV_FILE)
 
     if should_notify:
+        if event == "Stop" and title == "Codex 任务完成":
+            skip, skip_reason = should_skip_premature_stop(data, env_values, hook_started_at)
+            if skip:
+                write_log("debug", "notification suppressed", event=event, title=title, reason=skip_reason)
+                sys.stdout.write(json.dumps({"continue": True}, ensure_ascii=False))
+                return 0
         skip, skip_reason = should_skip_notification(data, title, reason, env_values)
         if skip:
             write_log("debug", "notification suppressed", event=event, title=title, reason=skip_reason)
