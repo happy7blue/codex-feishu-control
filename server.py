@@ -75,6 +75,25 @@ def compact(text: str, limit: int = 1800) -> str:
     return text[-limit:]
 
 
+def compact_line(text: str, limit: int = 120) -> str:
+    text = " ".join(str(text).split())
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)] + "..."
+
+
+def parse_utc_timestamp(value: str) -> Optional[dt.datetime]:
+    if not value:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
 def snapshot_similar(current: str, previous: str) -> bool:
     if current == previous:
         return True
@@ -120,6 +139,7 @@ class Config:
         self.notify_on_start = bool(self.codex.get("notify_on_start", False))
         self.progress_interval_seconds = int(self.codex.get("progress_interval_seconds", 1800))
         self.progress_summary_window = max(0, int(self.codex.get("progress_summary_window", 0)))
+        self.finish_summary_window = max(0, int(self.codex.get("finish_summary_window", 60)))
 
     @classmethod
     def from_file(cls, path: str) -> "Config":
@@ -231,6 +251,9 @@ class TaskManager:
         self.guard = RiskGuard(config.security.get("high_risk_policy", "plan"))
         self._lock = threading.Lock()
         self._processes: Dict[str, subprocess.Popen] = {}
+        self._finish_lock = threading.Lock()
+        self._pending_finished: Dict[str, List[Dict[str, Any]]] = {}
+        self._finish_timers: Dict[str, threading.Timer] = {}
         self.config.tasks_root.mkdir(parents=True, exist_ok=True)
         self._mark_orphan_running_tasks()
 
@@ -604,15 +627,71 @@ class TaskManager:
             meta["error"] = error
         self._save_meta(task_id, meta)
         self._append_log(task_id, f"[{utc_now()}] finished status={status} rc={return_code} error={error or ''}")
-        self._notify_finished(task_id, meta)
+        self._queue_finished_notification(task_id, meta)
+
+    def _queue_finished_notification(self, task_id: str, meta: Dict[str, Any]) -> None:
+        chat_id = meta.get("chat_id")
+        if not chat_id:
+            return
+        window = max(0, int(self.config.finish_summary_window))
+        if window == 0:
+            self._notify_finished(task_id, meta)
+            return
+        with self._finish_lock:
+            self._pending_finished.setdefault(chat_id, []).append(
+                {
+                    "task_id": task_id,
+                    "meta": dict(meta),
+                }
+            )
+            if chat_id in self._finish_timers:
+                return
+            timer = threading.Timer(window, self._flush_finished_notifications, args=(chat_id,))
+            timer.daemon = True
+            self._finish_timers[chat_id] = timer
+            timer.start()
+
+    def _flush_finished_notifications(self, chat_id: str) -> None:
+        with self._finish_lock:
+            entries = self._pending_finished.pop(chat_id, [])
+            self._finish_timers.pop(chat_id, None)
+        if not entries:
+            return
+        if len(entries) == 1:
+            entry = entries[0]
+            self._notify_finished(entry["task_id"], entry["meta"])
+            return
+        self._notify_finished_batch(chat_id, entries)
+
+    def _notify_finished_batch(self, chat_id: str, entries: List[Dict[str, Any]]) -> None:
+        lines = [f"【任务批量完成】共 {len(entries)} 个任务"]
+        for entry in entries:
+            lines.append(self._format_finished_batch_line(entry["task_id"], entry["meta"]))
+        text = "\n".join(lines)
+        try:
+            self.feishu.send_text(chat_id, text)
+        except Exception:
+            for entry in entries:
+                self._append_log(entry["task_id"], "发送批量完成通知失败：\n" + traceback.format_exc())
+
+    def _format_finished_batch_line(self, task_id: str, meta: Dict[str, Any]) -> str:
+        alias = meta.get("project_alias") or "-"
+        status = meta.get("status")
+        if status == STATUS_SUCCEEDED:
+            return f"✅ {task_id} {alias} — 成功"
+        if status == STATUS_FAILED:
+            error = compact_line(meta.get("error") or "未知错误", 140)
+            return f"❌ {task_id} {alias} — 失败：{error}"
+        if status == STATUS_TIMEOUT:
+            return f"⏱ {task_id} {alias} — 超时"
+        if status == STATUS_STOPPED:
+            return f"🛑 {task_id} {alias} — 已停止"
+        return f"{task_id} {alias} — {status or '已结束'}"
 
     def _notify_finished(self, task_id: str, meta: Dict[str, Any]) -> None:
         chat_id = meta.get("chat_id")
         if not chat_id:
             return
-        last_message = tail_text(self._last_message_path(task_id), 2400)
-        log_tail = tail_text(self._log_path(task_id), 1800)
-        body = last_message or log_tail or "没有可用输出。"
         title_map = {
             STATUS_SUCCEEDED: "任务完成",
             STATUS_FAILED: "任务失败",
@@ -620,18 +699,38 @@ class TaskManager:
             STATUS_STOPPED: "任务已停止",
         }
         title = title_map.get(meta.get("status"), "任务结束")
+        summary = self._finished_summary(task_id)
+        minutes = self._finished_minutes(meta)
         text = (
-            f"{title}\n"
-            f"任务: {task_id}\n"
-            f"项目: {meta.get('project_alias')}\n"
-            f"状态: {meta.get('status')}\n"
-            f"风险处理: {meta.get('risk_action')}\n\n"
-            f"摘要：\n{compact(body, 2500)}"
+            f"【{title}】\n"
+            f"项目：{meta.get('project_alias')}\n"
+            f"耗时：约 {minutes} 分钟\n"
+            f"结果：{meta.get('status')}\n"
+            f"摘要：{summary}"
         )
         try:
             self.feishu.send_text(chat_id, text)
         except Exception:
             self._append_log(task_id, "发送完成通知失败：\n" + traceback.format_exc())
+
+    def _finished_summary(self, task_id: str) -> str:
+        last_message = tail_text(self._last_message_path(task_id), 2400).strip()
+        if last_message:
+            return compact(last_message, 2400)
+        log_tail = tail_text(self._log_path(task_id), 300).strip()
+        if log_tail:
+            return compact(log_tail, 300)
+        return "无输出"
+
+    def _finished_minutes(self, meta: Dict[str, Any]) -> int:
+        created_at = parse_utc_timestamp(str(meta.get("created_at") or ""))
+        finished_at = parse_utc_timestamp(str(meta.get("finished_at") or ""))
+        if not created_at or not finished_at:
+            return 0
+        elapsed = max(0.0, (finished_at - created_at).total_seconds())
+        if elapsed <= 0:
+            return 0
+        return max(1, int((elapsed + 59) // 60))
 
     def _terminate_process(self, proc: subprocess.Popen, kill: bool = False) -> None:
         try:

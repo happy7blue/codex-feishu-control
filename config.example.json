@@ -20,6 +20,7 @@
     "timeout_seconds": 1800,
     "progress_interval_seconds": 1800,
     "progress_summary_window": 0,
+    "finish_summary_window": 60,
     "sandbox": "workspace-write",
     "model": "",
     "skip_git_repo_check": true,
