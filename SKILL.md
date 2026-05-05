@@ -1,9 +1,8 @@
 ---
 name: codex-feishu-control
 description: |
-  通过飞书远程控制 Codex 在本机执行编程任务，并在任务完成、超时或需要人工接管时主动推送通知。人不必守在电脑前，Agent 跑完或卡住时飞书告诉你。
-  适用场景：设置、启动、停止、查询 Codex 飞书控制服务；防止 Agent 死循环烧 Token；远程触发编程任务；接收任务结果摘要。
-  触发关键词：codex-feishu、飞书控制 Codex、远程触发任务、Agent 死循环告警、任务完成通知、人工接管推送、setup、start、stop、status、logs、doctor。
+  Codex 任务监控与人工接管通知。监控本机正在运行的 Codex 任务，当任务完成、失败、超时或陷入死循环时，主动通过飞书推送告警。让你放心离开电脑，看到消息再回来处理。具备风险管控、进展去重、防死循环强制终止等能力。
+  触发关键词：codex 监控、任务告警、人工接管、死循环告警、飞书通知、任务完成推送、超时告警、setup、start、stop、status、logs、doctor。
   不适用于：构建独立飞书机器人、webhook 集成、或与飞书 SDK 相关的普通编程任务。
 argument-hint: "setup | start | stop | status | logs [N] | reconfigure | doctor"
 allowed-tools: Bash, Read, Write, Glob
