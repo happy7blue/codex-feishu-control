@@ -429,10 +429,7 @@ def describe_event(data: dict) -> tuple[bool, str, str]:
         return True, "Codex 任务完成", "已结束"
 
     if event == "PostToolUse":
-        failed, reason = detect_failure(data)
-        if failed:
-            return True, "Codex 工具异常", reason
-        write_log("debug", "post tool notification skipped", tool=tool)
+        write_log("debug", "post tool notification disabled", tool=tool)
         return False, "", ""
 
     return False, "", ""
@@ -448,42 +445,6 @@ def state_key(data: dict, title: str, reason: str) -> str:
 def should_skip_notification(data: dict, title: str, reason: str, env_values: dict) -> tuple[bool, str]:
     event = data.get("hook_event_name") or "Unknown"
     cwd = data.get("cwd") or ""
-
-    if event == "PostToolUse" and title == "Codex 工具异常":
-        interval = int_config(
-            env_values,
-            "FEISHU_TOOL_FAILURE_MIN_INTERVAL_SECONDS",
-            DEFAULT_TOOL_FAILURE_MIN_INTERVAL_SECONDS,
-            0,
-            86400,
-        )
-        if interval <= 0:
-            return False, ""
-
-        now = time.time()
-        key = state_key(data, title, reason)
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        lock_path = STATE_FILE.with_suffix(".lock")
-
-        with lock_path.open("a+") as lock:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-            try:
-                state = json.loads(STATE_FILE.read_text(encoding="utf-8")) if STATE_FILE.exists() else {}
-            except Exception as exc:
-                write_log("warning", "failed to read notify state; resetting", error=str(exc))
-                state = {}
-
-            last = float(state.get(key, 0) or 0)
-            if last and now - last < interval:
-                return True, f"skip duplicate tool failure notification within {interval}s"
-
-            cutoff = now - 86400
-            state = {k: v for k, v in state.items() if isinstance(v, (int, float)) and v >= cutoff}
-            state[key] = now
-            tmp = STATE_FILE.with_suffix(".tmp")
-            tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-            tmp.replace(STATE_FILE)
-            return False, ""
 
     # Only throttle plain completion pushes. Approval and human-intervention
     # alerts must stay immediate.
