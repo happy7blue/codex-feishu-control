@@ -1,0 +1,34 @@
+{
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8787
+  },
+  "tasks_root": "~/.codex_feishu_tasks",
+  "default_project_alias": "demo",
+  "feishu": {
+    "bot_name": "Codex 控制员",
+    "event_mode": "websocket",
+    "app_id": "cli_xxxxxxxxxxxxxx",
+    "app_secret": "your_app_secret",
+    "verification_token": "your_verification_token",
+    "encrypt_key": "",
+    "allowed_open_ids": [],
+    "dry_run": true
+  },
+  "codex": {
+    "bin": "/Applications/Codex.app/Contents/Resources/codex",
+    "timeout_seconds": 1800,
+    "progress_interval_seconds": 1800,
+    "progress_summary_window": 0,
+    "sandbox": "workspace-write",
+    "model": "",
+    "skip_git_repo_check": true,
+    "notify_on_start": false
+  },
+  "security": {
+    "high_risk_policy": "plan"
+  },
+  "projects": {
+    "demo": "/Users/yourname/projects/demo"
+  }
+}
