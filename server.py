@@ -33,6 +33,29 @@ STATUS_REJECTED = "rejected"
 
 OPEN_API_BASE = "https://open.feishu.cn/open-apis"
 
+CONFLICT_PROMPT_TEMPLATE = """你是一个任务冲突检测器。请判断新任务与当前正在运行的任务是否存在冲突。
+
+判断标准（保守原则）：
+- 只要不能确定安全并行，就判定为冲突
+- 同一项目目录下，涉及写文件、修改代码、运行命令、安装依赖的任务，默认冲突
+- 只有明确是只读性质的任务（查看日志、读文件、生成文档）才允许与写任务并行
+- 不同项目目录的任务，只要操作性质不互相影响，可以并行
+
+新任务：
+项目：{new_project}
+描述：{new_prompt}
+
+当前正在运行的任务：
+{running_list}
+
+请只返回 JSON，格式如下，不要输出任何其他内容：
+{{
+  "conflict": true 或 false,
+  "conflict_with": ["task_id1", "task_id2"],
+  "reason": "判断理由"
+}}
+"""
+
 
 def utc_now() -> str:
     return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
@@ -109,6 +132,118 @@ def snapshot_similar(current: str, previous: str) -> bool:
 
 def safe_compare(a: str, b: str) -> bool:
     return secrets.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
+
+
+def _format_conflict_task_list(running_tasks: List[Dict[str, Any]]) -> str:
+    if not running_tasks:
+        return "无"
+    lines = []
+    for task in running_tasks:
+        lines.append(
+            "\n".join(
+                [
+                    f"- task_id: {task.get('task_id', '')}",
+                    f"  项目：{task.get('project_alias', '')} ({task.get('project_path', '')})",
+                    f"  状态：{task.get('status', '')}",
+                    f"  风险处理：{task.get('risk_action', '')}",
+                    f"  描述：{task.get('prompt', '')}",
+                ]
+            )
+        )
+    return "\n".join(lines)
+
+
+def _extract_json_object(text: str) -> Dict[str, Any]:
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end <= start:
+        raise ValueError("模型未返回 JSON 对象")
+    return json.loads(text[start : end + 1])
+
+
+def _normalize_conflict_result(data: Dict[str, Any], running_tasks: List[Dict[str, Any]]) -> Dict[str, Any]:
+    running_ids = {str(task.get("task_id", "")) for task in running_tasks if task.get("task_id")}
+    raw_conflict = data.get("conflict", True)
+    if isinstance(raw_conflict, bool):
+        conflict = raw_conflict
+    elif isinstance(raw_conflict, str) and raw_conflict.strip().lower() in ("true", "false"):
+        conflict = raw_conflict.strip().lower() == "true"
+    else:
+        conflict = True
+    raw_conflict_with = data.get("conflict_with") or []
+    if not isinstance(raw_conflict_with, list):
+        raw_conflict_with = [raw_conflict_with]
+    conflict_with = [str(item) for item in raw_conflict_with if str(item) in running_ids]
+    if conflict and not conflict_with:
+        conflict_with = sorted(running_ids)
+    return {
+        "conflict": conflict,
+        "conflict_with": conflict_with,
+        "reason": str(data.get("reason") or "模型未给出理由"),
+    }
+
+
+def check_conflict(new_task: Dict[str, Any], running_tasks: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not running_tasks:
+        return {"conflict": False, "conflict_with": [], "reason": "当前没有正在运行的任务"}
+
+    config = new_task.get("_config")
+    if not isinstance(config, Config):
+        task_ids = [str(task.get("task_id", "")) for task in running_tasks if task.get("task_id")]
+        return {"conflict": True, "conflict_with": task_ids, "reason": "缺少模型配置，按保守原则判定为冲突"}
+
+    new_project = f"{new_task.get('project_alias', '')} ({new_task.get('project_path', '')})"
+    prompt = CONFLICT_PROMPT_TEMPLATE.format(
+        new_project=new_project,
+        new_prompt=new_task.get("prompt", ""),
+        running_list=_format_conflict_task_list(running_tasks),
+    )
+    codex_bin = config.codex.get("bin", "/opt/homebrew/bin/codex")
+    project_path = Path(str(new_task.get("project_path") or "."))
+    cmd = [
+        codex_bin,
+        "exec",
+        "--cd",
+        str(project_path),
+        "--sandbox",
+        "read-only",
+        "--color",
+        "never",
+        "-c",
+        'approval_policy="never"',
+        "-",
+    ]
+    model = config.codex.get("model", "")
+    if model:
+        cmd[2:2] = ["--model", model]
+    if config.codex.get("skip_git_repo_check", False):
+        cmd.insert(-1, "--skip-git-repo-check")
+
+    try:
+        completed = subprocess.run(
+            cmd,
+            input=prompt,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=max(10, int(config.codex.get("conflict_timeout_seconds", 120))),
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(f"模型冲突检测退出码 {completed.returncode}: {compact(completed.stdout, 500)}")
+        return _normalize_conflict_result(_extract_json_object(completed.stdout), running_tasks)
+    except Exception as exc:
+        task_ids = [str(task.get("task_id", "")) for task in running_tasks if task.get("task_id")]
+        return {
+            "conflict": True,
+            "conflict_with": task_ids,
+            "reason": f"冲突检测失败，按保守原则判定为冲突：{exc}",
+        }
 
 
 @dataclass
@@ -254,6 +389,9 @@ class TaskManager:
         self._finish_lock = threading.Lock()
         self._pending_finished: Dict[str, List[Dict[str, Any]]] = {}
         self._finish_timers: Dict[str, threading.Timer] = {}
+        self._queue_lock = threading.Lock()
+        self.pending_queue: List[Dict[str, Any]] = []
+        self._queue_processing = False
         self.config.tasks_root.mkdir(parents=True, exist_ok=True)
         self._mark_orphan_running_tasks()
 
@@ -327,6 +465,18 @@ class TaskManager:
         items.sort(key=lambda x: x.get("created_at", ""), reverse=True)
         return items[:limit]
 
+    def _running_tasks(self) -> List[Dict[str, Any]]:
+        items = []
+        for meta_path in self.config.tasks_root.glob("*/meta.json"):
+            try:
+                meta = load_json(meta_path)
+            except Exception:
+                continue
+            if meta.get("status") == STATUS_RUNNING:
+                items.append(meta)
+        items.sort(key=lambda x: x.get("created_at", ""))
+        return items
+
     def status_text(self, task_id: Optional[str] = None) -> str:
         if task_id:
             meta = self._load_meta(task_id)
@@ -397,14 +547,8 @@ class TaskManager:
             return f"项目目录不存在或不是目录: {project_path}"
 
         action, reason = self.guard.classify(user_prompt)
-        task_id = time.strftime("%Y%m%d-%H%M%S-") + secrets.token_hex(3)
-        task_dir = self._task_dir(task_id)
-        task_dir.mkdir(parents=True, exist_ok=False)
-
-        meta = {
-            "task_id": task_id,
-            "status": STATUS_RUNNING if action != "reject" else STATUS_REJECTED,
-            "created_at": utc_now(),
+        new_task = {
+            "queue_id": secrets.token_hex(6),
             "project_alias": project_alias,
             "project_path": str(project_path),
             "prompt": user_prompt,
@@ -412,17 +556,95 @@ class TaskManager:
             "sender_open_id": sender_open_id,
             "risk_action": action,
             "risk_reason": reason,
+            "queued_at": utc_now(),
+            "_config": self.config,
+        }
+
+        if action == "reject":
+            task_id = self._reject_task(new_task)
+            return f"已拒绝高风险任务。\n任务: {task_id}\n原因: {reason}"
+
+        running_tasks = self._running_tasks()
+        if not running_tasks:
+            task_id, error = self._start_task_now(new_task)
+            if error:
+                return f"启动 Codex 失败。\n任务: {task_id}\n错误: {error}"
+            return f"✅ 无冲突，任务已直接启动\n任务: {task_id}"
+
+        conflict = check_conflict(new_task, running_tasks)
+        if not conflict.get("conflict"):
+            task_id, error = self._start_task_now(new_task)
+            if error:
+                return f"启动 Codex 失败。\n任务: {task_id}\n错误: {error}"
+            return (
+                "✅ 经检测无冲突，任务已直接启动\n"
+                f"检测理由：{conflict.get('reason')}\n"
+                f"任务: {task_id}"
+            )
+
+        with self._queue_lock:
+            self.pending_queue.append(dict(new_task))
+        conflict_with = ", ".join(conflict.get("conflict_with") or []) or "未指定"
+        return (
+            "⏳ 检测到冲突，任务已进入队列\n"
+            f"冲突任务：{conflict_with}\n"
+            f"原因：{conflict.get('reason')}\n"
+            "将在冲突任务完成后自动启动"
+        )
+
+    def _reject_task(self, task: Dict[str, Any]) -> str:
+        task_id = time.strftime("%Y%m%d-%H%M%S-") + secrets.token_hex(3)
+        task_dir = self._task_dir(task_id)
+        task_dir.mkdir(parents=True, exist_ok=False)
+        meta = {
+            "task_id": task_id,
+            "status": STATUS_REJECTED,
+            "created_at": utc_now(),
+            "project_alias": task.get("project_alias"),
+            "project_path": task.get("project_path"),
+            "prompt": task.get("prompt"),
+            "chat_id": task.get("chat_id"),
+            "sender_open_id": task.get("sender_open_id"),
+            "risk_action": task.get("risk_action"),
+            "risk_reason": task.get("risk_reason"),
+            "return_code": None,
+            "progress_notifications_sent": 0,
+            "finished_at": utc_now(),
+            "error": task.get("risk_reason"),
+        }
+        self._save_meta(task_id, meta)
+        self._append_log(
+            task_id,
+            f"[{utc_now()}] task={task_id} action={task.get('risk_action')} reason={task.get('risk_reason')}",
+        )
+        return task_id
+
+    def _start_task_now(self, task: Dict[str, Any]) -> Tuple[str, Optional[str]]:
+        project_alias = str(task.get("project_alias") or "")
+        project_path = Path(str(task.get("project_path") or ""))
+        user_prompt = str(task.get("prompt") or "")
+        action = str(task.get("risk_action") or "run")
+        reason = str(task.get("risk_reason") or "")
+        task_id = time.strftime("%Y%m%d-%H%M%S-") + secrets.token_hex(3)
+        task_dir = self._task_dir(task_id)
+        task_dir.mkdir(parents=True, exist_ok=False)
+
+        meta = {
+            "task_id": task_id,
+            "status": STATUS_RUNNING,
+            "created_at": utc_now(),
+            "project_alias": project_alias,
+            "project_path": str(project_path),
+            "prompt": user_prompt,
+            "chat_id": task.get("chat_id"),
+            "sender_open_id": task.get("sender_open_id"),
+            "risk_action": action,
+            "risk_reason": reason,
             "return_code": None,
             "progress_notifications_sent": 0,
         }
         self._save_meta(task_id, meta)
         self._append_log(task_id, f"[{utc_now()}] task={task_id} action={action} reason={reason}")
-
-        if action == "reject":
-            meta["finished_at"] = utc_now()
-            meta["error"] = reason
-            self._save_meta(task_id, meta)
-            return f"已拒绝高风险任务。\n任务: {task_id}\n原因: {reason}"
 
         prompt = self._build_codex_prompt(project_alias, project_path, user_prompt, action, reason)
         cmd = self._build_codex_cmd(project_path, action, task_id)
@@ -442,7 +664,7 @@ class TaskManager:
             meta["finished_at"] = utc_now()
             meta["error"] = str(exc)
             self._save_meta(task_id, meta)
-            return f"启动 Codex 失败。\n任务: {task_id}\n错误: {exc}"
+            return task_id, str(exc)
 
         with self._lock:
             self._processes[task_id] = proc
@@ -453,12 +675,71 @@ class TaskManager:
             daemon=True,
         )
         watcher.start()
+        return task_id, None
 
-        if self.config.notify_on_start:
-            self.feishu.send_text(chat_id, f"任务已启动: {task_id}")
-        if action == "plan":
-            return f"已启动计划模式任务: {task_id}\n原因: {reason}"
-        return f"已启动任务: {task_id}"
+    def _process_pending_queue_async(self) -> None:
+        with self._queue_lock:
+            if self._queue_processing or not self.pending_queue:
+                return
+            self._queue_processing = True
+        worker = threading.Thread(target=self._process_pending_queue, name="pending-queue", daemon=True)
+        worker.start()
+
+    def _process_pending_queue(self) -> None:
+        try:
+            with self._queue_lock:
+                if not self.pending_queue:
+                    return
+                task = dict(self.pending_queue[0])
+            task["_config"] = self.config
+            running_tasks = self._running_tasks()
+            if running_tasks:
+                conflict = check_conflict(task, running_tasks)
+            else:
+                conflict = {"conflict": False, "conflict_with": [], "reason": "当前没有正在运行的任务"}
+
+            if conflict.get("conflict"):
+                conflict_with = ", ".join(conflict.get("conflict_with") or []) or "未指定"
+                self._send_queue_text(
+                    task,
+                    "⏳ 队列任务仍在等待\n"
+                    f"冲突任务：{conflict_with}",
+                )
+                return
+
+            with self._queue_lock:
+                if not self.pending_queue or self.pending_queue[0].get("queue_id") != task.get("queue_id"):
+                    return
+                self.pending_queue.pop(0)
+
+            task_id, error = self._start_task_now(task)
+            if error:
+                self._send_queue_text(
+                    task,
+                    "队列任务自动启动失败\n"
+                    f"项目：{task.get('project_alias')}\n"
+                    f"任务：{task.get('prompt')}\n"
+                    f"错误：{error}",
+                )
+                return
+            self._send_queue_text(
+                task,
+                "🚀 队列任务已自动启动\n"
+                f"项目：{task.get('project_alias')}\n"
+                f"任务：{task.get('prompt')}",
+            )
+        finally:
+            with self._queue_lock:
+                self._queue_processing = False
+
+    def _send_queue_text(self, task: Dict[str, Any], text: str) -> None:
+        chat_id = task.get("chat_id")
+        if not chat_id:
+            return
+        try:
+            self.feishu.send_text(str(chat_id), text)
+        except Exception:
+            traceback.print_exc()
 
     def _build_codex_cmd(self, project_path: Path, action: str, task_id: str) -> List[str]:
         codex_bin = self.config.codex.get("bin", "/opt/homebrew/bin/codex")
@@ -628,6 +909,7 @@ class TaskManager:
         self._save_meta(task_id, meta)
         self._append_log(task_id, f"[{utc_now()}] finished status={status} rc={return_code} error={error or ''}")
         self._queue_finished_notification(task_id, meta)
+        self._process_pending_queue_async()
 
     def _queue_finished_notification(self, task_id: str, meta: Dict[str, Any]) -> None:
         chat_id = meta.get("chat_id")
@@ -818,16 +1100,19 @@ class CommandRouter:
 
     def _start_task(self, project_alias: str, prompt: str, msg: FeishuMessage) -> Optional[str]:
         reply = self.tasks.start(project_alias, prompt, msg.chat_id, msg.sender_open_id)
-        started = reply.startswith("已启动任务:") or reply.startswith("已启动计划模式任务:")
+        task_id = self._extract_task_id(reply)
+        started = bool(
+            task_id
+            and (
+                reply.startswith("已启动任务:")
+                or reply.startswith("已启动计划模式任务:")
+                or "已直接启动" in reply
+            )
+        )
         if started:
             self._set_current_project(msg, project_alias)
-            task_id = self._extract_task_id(reply)
-            if task_id:
-                self._set_current_task(msg, task_id)
+            self._set_current_task(msg, task_id)
             print(reply, flush=True)
-            if self.config.notify_on_start:
-                return reply
-            return None
         return reply
 
     def _natural_task(self, text: str, msg: Optional[FeishuMessage] = None) -> Tuple[str, str]:
