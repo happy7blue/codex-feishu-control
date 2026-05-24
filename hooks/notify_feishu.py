@@ -26,6 +26,7 @@ LOG_FILE = LOG_DIR / "notify_feishu.log"
 STATE_FILE = LOG_DIR / "notify_feishu_state.json"
 MONITOR_STATE_FILE = LOG_DIR / "codex_task_monitor_state.json"
 MAX_FIELD_LEN = 1600
+TASK_SUMMARY_LEN = 30
 DEFAULT_FEISHU_API_BASE = "https://open.feishu.cn/open-apis"
 DEFAULT_STOP_MIN_INTERVAL_SECONDS = 10
 DEFAULT_ROOT_STOP_DUPLICATE_WINDOW_SECONDS = 10
@@ -44,6 +45,10 @@ def compact_line(text: str, limit: int = 120) -> str:
     if len(text) <= limit:
         return text
     return text[: max(0, limit - 3)] + "..."
+
+
+def task_summary(text: str) -> str:
+    return compact_line(text or "未记录", TASK_SUMMARY_LEN)
 
 
 def timestamp_to_epoch(value: str) -> float:
@@ -839,7 +844,7 @@ def build_stop_message(title: str, cwd: str, reason: str, last_message: str, dev
         f"设备：{device}",
         "事件：Stop",
         f"目录：{cwd}",
-        f"任务：{task or '未记录'}",
+        f"任务：{task_summary(task)}",
         f"摘要：{summary}",
     ]
     return "\n".join(lines)
@@ -877,7 +882,7 @@ def build_message(
             f"设备：{device}",
             f"事件：{event}",
             f"目录：{display_cwd(data)}",
-            f"任务：{task}",
+            f"任务：{task_summary(task)}",
         ]
         if tool != "-":
             lines.append(f"工具：{tool}")

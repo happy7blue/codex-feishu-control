@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- 飞书通知里的任务摘要超过 30 个字符时自动截断并追加省略号，避免完整指令撑长消息。
 - 补回 `codex-mini-monitor` 依赖的 `load_monitor_state`、`save_monitor_state`、`update_monitor_state` 等兼容函数。
 - 恢复 `CodexMonitorComplete`、`CodexMonitorTimeout`、`CodexMonitorStuck` 三类验收事件的飞书推送。
 - 修复 Mac mini 环境中 shell 变量覆盖 `feishu.env` 后造成的 `open_id cross app` 风险：飞书 App 凭证和接收人 ID 优先从 `feishu.env` 读取，保证 App ID 与 open_id 成对使用。
