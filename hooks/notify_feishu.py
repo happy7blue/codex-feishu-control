@@ -24,6 +24,7 @@ LOG_DIR = CODEX_HOME / "logs"
 ENV_FILE = HOOKS_DIR / "feishu.env"
 LOG_FILE = LOG_DIR / "notify_feishu.log"
 STATE_FILE = LOG_DIR / "notify_feishu_state.json"
+MONITOR_STATE_FILE = LOG_DIR / "codex_task_monitor_state.json"
 MAX_FIELD_LEN = 1600
 DEFAULT_FEISHU_API_BASE = "https://open.feishu.cn/open-apis"
 DEFAULT_STOP_MIN_INTERVAL_SECONDS = 10
@@ -31,6 +32,7 @@ DEFAULT_ROOT_STOP_DUPLICATE_WINDOW_SECONDS = 10
 DEFAULT_TOOL_FAILURE_MIN_INTERVAL_SECONDS = 300
 DEFAULT_STOP_SETTLE_SECONDS = 2
 DEFAULT_STOP_COMPLETION_LOOKBACK_SECONDS = 5
+DEFAULT_NOTIFY_PREFIX = "【Codex-mini】"
 
 
 def now_local() -> str:
@@ -365,17 +367,21 @@ def config_value(env_values: dict, key: str, default: str = "") -> str:
     return os.environ.get(key) or env_values.get(key) or default
 
 
+def env_file_value(env_values: dict, key: str, default: str = "") -> str:
+    return env_values.get(key) or os.environ.get(key) or default
+
+
 def get_webhook_url(env_values: dict) -> str:
     return config_value(env_values, "FEISHU_WEBHOOK_URL")
 
 
 def get_app_config(env_values: dict) -> dict:
     return {
-        "app_id": config_value(env_values, "FEISHU_APP_ID"),
-        "app_secret": config_value(env_values, "FEISHU_APP_SECRET"),
-        "receive_id_type": config_value(env_values, "FEISHU_RECEIVE_ID_TYPE", "open_id"),
-        "receive_id": config_value(env_values, "FEISHU_RECEIVE_ID"),
-        "api_base": config_value(env_values, "FEISHU_API_BASE", DEFAULT_FEISHU_API_BASE).rstrip("/"),
+        "app_id": env_file_value(env_values, "FEISHU_APP_ID"),
+        "app_secret": env_file_value(env_values, "FEISHU_APP_SECRET"),
+        "receive_id_type": env_file_value(env_values, "FEISHU_RECEIVE_ID_TYPE", "open_id"),
+        "receive_id": env_file_value(env_values, "FEISHU_RECEIVE_ID"),
+        "api_base": env_file_value(env_values, "FEISHU_API_BASE", DEFAULT_FEISHU_API_BASE).rstrip("/"),
     }
 
 
@@ -404,10 +410,186 @@ def int_config(env_values: dict, key: str, default: int, minimum: int, maximum: 
         return default
 
 
+def notification_prefix(env_values: dict | None = None) -> str:
+    env_values = env_values or {}
+    return config_value(env_values, "CODEX_NOTIFY_PREFIX", DEFAULT_NOTIFY_PREFIX)
+
+
+def format_duration(seconds: int | float | None) -> str:
+    try:
+        total = max(0, int(float(seconds or 0)))
+    except (TypeError, ValueError):
+        total = 0
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}小时{minutes}分{secs}秒"
+    if minutes:
+        return f"{minutes}分{secs}秒"
+    return f"{secs}秒"
+
+
+def task_start_epoch_from_transcript(path_value: str) -> float:
+    if not path_value:
+        return 0.0
+    try:
+        path = Path(path_value).expanduser().resolve()
+        codex_home = CODEX_HOME.expanduser().resolve()
+        if codex_home not in path.parents and path != codex_home:
+            return 0.0
+        if not path.exists() or not path.is_file():
+            return 0.0
+        max_bytes = 1024 * 1024
+        with path.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - max_bytes), os.SEEK_SET)
+            raw = fh.read().decode("utf-8", errors="replace")
+        for line in reversed(raw.splitlines()):
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            payload = row.get("payload") if isinstance(row, dict) else None
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("type") != "message" or payload.get("role") != "user":
+                continue
+            text = extract_content_text(payload.get("content")).strip()
+            if text and not is_system_scaffold_message(text):
+                return timestamp_to_epoch(str(row.get("timestamp") or ""))
+    except Exception as exc:
+        write_log("debug", "failed to read transcript task start", error=str(exc))
+    return 0.0
+
+
 def fingerprint(value: str) -> str:
     if not value:
         return "-"
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+
+
+def monitor_task_id(data: dict) -> str:
+    transcript = data.get("transcript_path") or data.get("transcript") or ""
+    if isinstance(transcript, str) and transcript.strip():
+        return fingerprint("transcript:" + str(Path(transcript).expanduser()))
+    identity = "|".join(
+        [
+            display_cwd(data),
+            task_description(data, 120),
+            str(data.get("thread_id") or data.get("conversation_id") or ""),
+        ]
+    )
+    return fingerprint("fallback:" + identity)
+
+
+def monitor_step(data: dict, event: str, reason: str) -> str:
+    if data.get("monitor_step"):
+        return compact_line(str(data.get("monitor_step")), 160)
+    tool = data.get("tool_name") or data.get("tool") or ""
+    if event == "PostToolUse":
+        return f"工具执行完成：{tool}" if tool else "工具执行完成"
+    if event == "PermissionRequest":
+        return f"等待权限确认：{tool}" if tool else "等待权限确认"
+    if event == "Stop":
+        return compact_line(reason or "任务结束", 160)
+    return compact_line(reason or event, 160)
+
+
+def load_monitor_state() -> dict:
+    if not MONITOR_STATE_FILE.exists():
+        return {"version": 1, "tasks": {}}
+    try:
+        state = json.loads(MONITOR_STATE_FILE.read_text(encoding="utf-8"))
+    except Exception as exc:
+        write_log("warning", "failed to read monitor state; resetting", error=str(exc))
+        return {"version": 1, "tasks": {}}
+    if not isinstance(state, dict):
+        return {"version": 1, "tasks": {}}
+    tasks = state.get("tasks")
+    if not isinstance(tasks, dict):
+        state["tasks"] = {}
+    state.setdefault("version", 1)
+    return state
+
+
+def save_monitor_state(state: dict) -> None:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = MONITOR_STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(MONITOR_STATE_FILE)
+
+
+def update_monitor_state(data: dict, title: str = "", reason: str = "") -> dict:
+    event = data.get("hook_event_name") or "Unknown"
+    if event.startswith("CodexMonitor"):
+        return {
+            "id": str(data.get("monitor_task_id") or "-"),
+            "duration_seconds": int(data.get("monitor_duration_seconds") or 0),
+            "last_step": compact_line(str(data.get("monitor_step") or reason or "-"), 160),
+            "task": compact_line(str(data.get("task_prompt") or data.get("task") or "未记录"), 120),
+        }
+    if event not in {"PostToolUse", "PermissionRequest", "Stop"}:
+        return {}
+
+    now = time.time()
+    task_id = monitor_task_id(data)
+    transcript = data.get("transcript_path") or data.get("transcript") or ""
+    started_at = task_start_epoch_from_transcript(transcript) if isinstance(transcript, str) else 0.0
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path = MONITOR_STATE_FILE.with_suffix(".lock")
+
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        state = load_monitor_state()
+        tasks = state.setdefault("tasks", {})
+        task = tasks.get(task_id) if isinstance(tasks.get(task_id), dict) else {}
+        if not started_at:
+            started_at = float(task.get("started_at") or now)
+
+        status = "running"
+        if event == "PermissionRequest" or "人工介入" in title or "需要确认" in title:
+            status = "blocked"
+        elif event == "Stop":
+            status = "done" if title == "Codex 任务完成" else "blocked"
+
+        task.update(
+            {
+                "id": task_id,
+                "status": status,
+                "started_at": started_at,
+                "updated_at": now,
+                "last_activity_at": now,
+                "cwd": display_cwd(data),
+                "task": task_description(data, 120) or task.get("task") or "未记录",
+                "last_step": monitor_step(data, event, reason),
+            }
+        )
+        if isinstance(transcript, str) and transcript:
+            task["transcript_path"] = str(Path(transcript).expanduser())
+        if event == "Stop":
+            task["finished_at"] = now
+        if status == "blocked":
+            task["blocked_at"] = task.get("blocked_at") or now
+            task["blocked_reason"] = reason or title
+
+        cutoff = now - 86400
+        tasks[task_id] = task
+        state["tasks"] = {
+            key: value
+            for key, value in tasks.items()
+            if isinstance(value, dict)
+            and (value.get("status") == "running" or float(value.get("updated_at") or 0) >= cutoff)
+        }
+        save_monitor_state(state)
+
+    return {
+        "id": task_id,
+        "duration_seconds": max(0, int(now - started_at)),
+        "last_step": task.get("last_step") or reason or "-",
+        "task": task.get("task") or "未记录",
+        "status": task.get("status") or status,
+    }
 
 
 def response_summary(payload) -> dict:
@@ -520,6 +702,15 @@ def describe_event(data: dict) -> tuple[bool, str, str]:
         if needs_human:
             return True, "Codex 可能需要人工介入", reason
         return True, "Codex 任务完成", "已结束"
+
+    if event == "CodexMonitorTimeout":
+        return True, "Codex 任务超时", data.get("monitor_reason") or "任务运行超过 1 小时"
+
+    if event == "CodexMonitorStuck":
+        return True, "Codex 任务卡住", data.get("monitor_reason") or "超过阈值未观察到 Codex 活动"
+
+    if event == "CodexMonitorComplete":
+        return True, "Codex 任务完成", data.get("monitor_reason") or "任务已完成"
 
     if event == "PostToolUse":
         write_log("debug", "post tool notification disabled", tool=tool)
@@ -654,12 +845,50 @@ def build_stop_message(title: str, cwd: str, reason: str, last_message: str, dev
     return "\n".join(lines)
 
 
-def build_message(data: dict, title: str, reason: str, env_values: dict | None = None) -> str:
+def build_message(
+    data: dict,
+    title: str,
+    reason: str,
+    env_values: dict | None = None,
+    monitor_info: dict | None = None,
+) -> str:
+    env_values = env_values or {}
+    monitor_info = monitor_info or {}
     event = data.get("hook_event_name") or "Unknown"
     tool = data.get("tool_name") or "-"
-    cwd = data.get("cwd") or "-"
     last_message = data.get("last_assistant_message") or ""
     device = display_host(env_values)
+
+    if event.startswith("CodexMonitor"):
+        duration = monitor_info.get("duration_seconds")
+        if duration is None:
+            duration = data.get("monitor_duration_seconds") or 0
+        task = (
+            monitor_info.get("task")
+            or task_description(data, 120)
+            or data.get("task_prompt")
+            or "未记录"
+        )
+        summary = compact_line(last_message, 160) if last_message else compact_line(reason or "-", 160)
+        lines = [
+            f"{notification_prefix(env_values)}任务状态：{title}",
+            f"运行时长：{format_duration(duration)}",
+            f"时间：{now_local()}",
+            f"设备：{device}",
+            f"事件：{event}",
+            f"目录：{display_cwd(data)}",
+            f"任务：{task}",
+        ]
+        if tool != "-":
+            lines.append(f"工具：{tool}")
+        if "卡住" in title:
+            lines.append(f"卡住位置：{monitor_info.get('last_step') or compact_line(reason or '-', 160)}")
+            lines.append(f"说明：{compact_line(reason or '-', 160)}")
+        elif "超时" in title:
+            lines.append(f"说明：{compact_line(reason or '任务运行超过阈值', 160)}")
+        else:
+            lines.append(f"摘要：{summary}")
+        return "\n".join(lines)
 
     if event == "Stop":
         return build_stop_message(title, display_cwd(data), reason, last_message, device, task_description(data, 100))

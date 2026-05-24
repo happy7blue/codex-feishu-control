@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 .env
 *.log
+hooks/feishu.env
+hooks/feishu.env.*
+hooks/*.bak.*
