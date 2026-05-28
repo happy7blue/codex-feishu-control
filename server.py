@@ -1503,7 +1503,7 @@ def run_websocket(config: Config) -> None:
         auto_reconnect=True,
     )
     print("Codex 飞书控制服务已启动：飞书长连接模式", flush=True)
-    print(f"App ID: {app_id}", flush=True)
+    print(f"[Feishu] App ID: {app_id[:4]}****", flush=True)
     print(f"配置文件: {config.config_path}", flush=True)
     print(f"任务目录: {config.tasks_root}", flush=True)
     print(f"完成通知合并窗口: {config.finish_summary_window} 秒", flush=True)
