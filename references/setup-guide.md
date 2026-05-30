@@ -56,5 +56,40 @@ launchctl list | grep codex-feishu
 
 在飞书给机器人发送"帮助"，收到回复即表示配置成功。
 
+## Web 控制台模式
+
+如果要从 MacBook 浏览器控制公司 Mac mini 上的 Codex，推荐先让两台机器登录同一个 Tailscale tailnet。
+
+Mac mini 的 `config.json` 增加：
+
+```json
+{
+  "web": {
+    "enabled": true,
+    "host": "127.0.0.1",
+    "port": 8787,
+    "auth_token": "替换为一串随机长 token"
+  }
+}
+```
+
+可以用下面命令生成 token：
+
+```bash
+openssl rand -hex 32
+```
+
+本机验证时访问 `http://127.0.0.1:8787`。确认可用后，可以把 `web.host` 改成 Mac mini 的 Tailscale IP，或使用 `0.0.0.0` 并只通过 Tailscale 访问。
+
+Web 控制台支持：
+
+- 查看项目白名单和目录；
+- 浏览项目根目录内文件列表；
+- 新建 Codex 任务；
+- 查看任务列表、详情、日志和最终摘要；
+- 停止运行中的任务。
+
+Web API 使用 `web.auth_token` 鉴权。这个 token 只放本机 `config.json`，不要提交到 Git 仓库。
+
 ## HTTP 模式补充
 如果使用 HTTP 模式，event_mode 改为 http，飞书事件订阅页面填入回调地址 https://your-domain.com/feishu/events，并将 verification_token 填入 config.json。

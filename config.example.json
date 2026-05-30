@@ -3,6 +3,12 @@
     "host": "127.0.0.1",
     "port": 8787
   },
+  "web": {
+    "enabled": true,
+    "host": "127.0.0.1",
+    "port": 8787,
+    "auth_token": "replace-with-a-long-random-token"
+  },
   "tasks_root": "~/.codex_feishu_tasks",
   "default_project_alias": "demo",
   "feishu": {

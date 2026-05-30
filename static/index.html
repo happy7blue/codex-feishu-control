@@ -1,0 +1,651 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Codex 远程控制台</title>
+  <style>
+    :root {
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --panel-2: #eef5f1;
+      --text: #1e2328;
+      --muted: #68727d;
+      --line: #d9e0e6;
+      --accent: #24785a;
+      --accent-2: #174f3d;
+      --danger: #b33a3a;
+      --warn: #996b16;
+      --radius: 8px;
+      --shadow: 0 12px 30px rgba(25, 35, 45, .08);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      letter-spacing: 0;
+    }
+    button, input, textarea, select {
+      font: inherit;
+    }
+    button {
+      border: 1px solid var(--line);
+      background: var(--panel);
+      color: var(--text);
+      border-radius: 7px;
+      min-height: 34px;
+      padding: 0 12px;
+      cursor: pointer;
+    }
+    button:hover { border-color: var(--accent); }
+    button.primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: white;
+    }
+    button.danger {
+      border-color: rgba(179, 58, 58, .35);
+      color: var(--danger);
+    }
+    input, textarea, select {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: white;
+      color: var(--text);
+      padding: 9px 10px;
+      outline: none;
+    }
+    input:focus, textarea:focus, select:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(36, 120, 90, .14);
+    }
+    textarea {
+      min-height: 128px;
+      resize: vertical;
+      line-height: 1.5;
+    }
+    .topbar {
+      display: grid;
+      grid-template-columns: minmax(210px, 1fr) minmax(320px, 520px);
+      gap: 16px;
+      align-items: center;
+      min-height: 64px;
+      padding: 12px 18px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(255, 255, 255, .9);
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      backdrop-filter: blur(14px);
+    }
+    .brand {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      min-width: 0;
+    }
+    .mark {
+      width: 34px;
+      height: 34px;
+      border-radius: 7px;
+      background: linear-gradient(135deg, #24785a, #3f7d9a);
+      flex: 0 0 auto;
+    }
+    .brand h1 {
+      font-size: 18px;
+      line-height: 1.2;
+      margin: 0;
+      font-weight: 700;
+    }
+    .brand p {
+      margin: 3px 0 0;
+      color: var(--muted);
+      font-size: 13px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .auth {
+      display: grid;
+      grid-template-columns: 1fr auto auto;
+      gap: 8px;
+      align-items: center;
+    }
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(230px, 300px) minmax(360px, 1fr) minmax(340px, 520px);
+      gap: 14px;
+      padding: 14px;
+      min-height: calc(100vh - 64px);
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      min-width: 0;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+    .panel header {
+      padding: 14px;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+    }
+    .panel h2 {
+      font-size: 15px;
+      margin: 0;
+      line-height: 1.25;
+    }
+    .panel-body {
+      padding: 14px;
+      overflow: auto;
+      min-height: 0;
+      flex: 1;
+    }
+    .stack { display: grid; gap: 12px; }
+    .row { display: flex; gap: 8px; align-items: center; }
+    .row > * { min-width: 0; }
+    .muted { color: var(--muted); font-size: 13px; }
+    .status {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      min-height: 24px;
+      padding: 0 8px;
+      border-radius: 999px;
+      background: var(--panel-2);
+      color: var(--accent-2);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .status.bad { color: var(--danger); background: #faeeee; }
+    .status.warn { color: var(--warn); background: #fff4dd; }
+    .list {
+      display: grid;
+      gap: 8px;
+    }
+    .item {
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 10px;
+      background: #fff;
+      cursor: pointer;
+    }
+    .item:hover, .item.active {
+      border-color: var(--accent);
+      background: #f3faf7;
+    }
+    .item-title {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      font-weight: 650;
+      line-height: 1.35;
+      overflow-wrap: anywhere;
+    }
+    .item-meta {
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+      overflow-wrap: anywhere;
+    }
+    .crumbs {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      align-items: center;
+      margin-bottom: 10px;
+    }
+    .crumbs button {
+      min-height: 28px;
+      padding: 0 8px;
+      font-size: 12px;
+    }
+    .file-row {
+      display: grid;
+      grid-template-columns: 22px 1fr auto;
+      gap: 8px;
+      align-items: center;
+      min-height: 34px;
+      border-bottom: 1px solid #edf1f4;
+      font-size: 13px;
+    }
+    .file-row button {
+      padding: 0;
+      border: 0;
+      text-align: left;
+      min-height: 28px;
+      background: transparent;
+      overflow-wrap: anywhere;
+    }
+    .task-grid {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px;
+      align-items: start;
+    }
+    pre {
+      margin: 0;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      line-height: 1.45;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+    }
+    .log {
+      background: #171b20;
+      color: #ecf1f5;
+      border-radius: 7px;
+      padding: 12px;
+      min-height: 260px;
+      max-height: 48vh;
+      overflow: auto;
+    }
+    .empty {
+      color: var(--muted);
+      border: 1px dashed var(--line);
+      border-radius: 7px;
+      padding: 14px;
+      text-align: center;
+      font-size: 13px;
+    }
+    .notice {
+      border-left: 3px solid var(--accent);
+      background: #f1f8f5;
+      padding: 10px 12px;
+      border-radius: 7px;
+      color: #24463a;
+      font-size: 13px;
+      line-height: 1.5;
+    }
+    @media (max-width: 1080px) {
+      .layout { grid-template-columns: 280px 1fr; }
+      .detail { grid-column: 1 / -1; }
+    }
+    @media (max-width: 760px) {
+      .topbar { grid-template-columns: 1fr; }
+      .auth { grid-template-columns: 1fr auto; }
+      .auth button:last-child { grid-column: 1 / -1; }
+      .layout { grid-template-columns: 1fr; padding: 10px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <div class="brand">
+      <div class="mark" aria-hidden="true"></div>
+      <div>
+        <h1>Codex 远程控制台</h1>
+        <p id="healthText">等待连接 Mac mini</p>
+      </div>
+    </div>
+    <div class="auth">
+      <input id="tokenInput" type="password" autocomplete="current-password" placeholder="输入 web.auth_token">
+      <button id="saveTokenBtn">保存</button>
+      <button id="refreshBtn" class="primary">刷新</button>
+    </div>
+  </div>
+
+  <main class="layout">
+    <section class="panel">
+      <header>
+        <h2>项目与目录</h2>
+        <span id="projectCount" class="status">0 个项目</span>
+      </header>
+      <div class="panel-body stack">
+        <div id="projectList" class="list"></div>
+        <div>
+          <div id="crumbs" class="crumbs"></div>
+          <div id="fileList" class="list"></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <header>
+        <h2>任务</h2>
+        <span id="taskStatus" class="status">待刷新</span>
+      </header>
+      <div class="panel-body stack">
+        <div class="stack">
+          <select id="projectSelect"></select>
+          <textarea id="promptInput" placeholder="描述要让 Mac mini 上的 Codex 执行的任务"></textarea>
+          <div class="task-grid">
+            <div id="startResult" class="muted"></div>
+            <button id="startBtn" class="primary">新建任务</button>
+          </div>
+        </div>
+        <div>
+          <h2>运行与最近任务</h2>
+          <div id="taskList" class="list" style="margin-top: 10px;"></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel detail">
+      <header>
+        <h2>任务详情</h2>
+        <div class="row">
+          <button id="stopBtn" class="danger">停止</button>
+          <button id="logBtn">日志</button>
+        </div>
+      </header>
+      <div class="panel-body stack">
+        <div id="taskDetail" class="empty">选择一个任务查看详情</div>
+        <div class="log"><pre id="logView">暂无日志</pre></div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const state = {
+      token: localStorage.getItem("codex_web_token") || "",
+      projects: [],
+      currentProject: "",
+      currentPath: "",
+      currentTask: "",
+      poll: null,
+    };
+
+    const $ = (id) => document.getElementById(id);
+
+    function authHeaders() {
+      return {
+        "Authorization": `Bearer ${state.token}`,
+        "Content-Type": "application/json",
+      };
+    }
+
+    async function api(path, options = {}) {
+      const response = await fetch(path, {
+        ...options,
+        headers: { ...authHeaders(), ...(options.headers || {}) },
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data.error || `请求失败：${response.status}`);
+      }
+      return data;
+    }
+
+    function setText(id, text) {
+      $(id).textContent = text;
+    }
+
+    function statusClass(status) {
+      if (["failed", "timeout", "rejected"].includes(status)) return "status bad";
+      if (["running", "queued"].includes(status)) return "status warn";
+      return "status";
+    }
+
+    function taskTitle(task) {
+      return task.prompt || task.task_id || "未命名任务";
+    }
+
+    function renderProjects() {
+      $("projectCount").textContent = `${state.projects.length} 个项目`;
+      $("projectList").innerHTML = "";
+      $("projectSelect").innerHTML = "";
+      for (const project of state.projects) {
+        const option = document.createElement("option");
+        option.value = project.alias;
+        option.textContent = project.alias;
+        $("projectSelect").appendChild(option);
+
+        const div = document.createElement("div");
+        div.className = `item ${project.alias === state.currentProject ? "active" : ""}`;
+        div.innerHTML = `
+          <div class="item-title">
+            <span>${escapeHtml(project.alias)}</span>
+            <span class="${project.exists ? "status" : "status bad"}">${project.exists ? "可用" : "不可用"}</span>
+          </div>
+          <div class="item-meta">${escapeHtml(project.path)}</div>
+        `;
+        div.onclick = () => selectProject(project.alias);
+        $("projectList").appendChild(div);
+      }
+      if (state.currentProject) $("projectSelect").value = state.currentProject;
+    }
+
+    async function selectProject(alias) {
+      state.currentProject = alias;
+      state.currentPath = "";
+      $("projectSelect").value = alias;
+      renderProjects();
+      await loadFiles();
+    }
+
+    async function loadHealth() {
+      const data = await api("/api/health");
+      const name = data.computer_name || data.hostname || "Mac mini";
+      const codex = data.codex_executable ? "Codex 可用" : "Codex 不可执行";
+      setText("healthText", `${name} · ${codex} · ${data.time}`);
+    }
+
+    async function loadProjects() {
+      const data = await api("/api/projects");
+      state.projects = data.projects || [];
+      if (!state.currentProject) {
+        const preferred = state.projects.find((p) => p.is_default && p.exists) || state.projects.find((p) => p.exists);
+        state.currentProject = preferred ? preferred.alias : "";
+      }
+      renderProjects();
+      if (state.currentProject) await loadFiles();
+    }
+
+    function renderCrumbs(path) {
+      const parts = path ? path.split("/").filter(Boolean) : [];
+      $("crumbs").innerHTML = "";
+      const root = document.createElement("button");
+      root.textContent = "项目根目录";
+      root.onclick = () => { state.currentPath = ""; loadFiles(); };
+      $("crumbs").appendChild(root);
+      let cursor = "";
+      for (const part of parts) {
+        cursor = cursor ? `${cursor}/${part}` : part;
+        const target = cursor;
+        const btn = document.createElement("button");
+        btn.textContent = part;
+        btn.onclick = () => { state.currentPath = target; loadFiles(); };
+        $("crumbs").appendChild(btn);
+      }
+    }
+
+    async function loadFiles() {
+      if (!state.currentProject) {
+        $("fileList").innerHTML = '<div class="empty">没有可用项目</div>';
+        return;
+      }
+      const params = new URLSearchParams({ project: state.currentProject, path: state.currentPath });
+      const data = await api(`/api/files?${params.toString()}`);
+      state.currentPath = data.path || "";
+      renderCrumbs(state.currentPath);
+      $("fileList").innerHTML = "";
+      if (data.parent !== data.path && state.currentPath) {
+        addFileRow("..", "上级目录", "directory", () => {
+          state.currentPath = data.parent || "";
+          loadFiles();
+        });
+      }
+      for (const entry of data.entries || []) {
+        const clickable = entry.type === "directory";
+        addFileRow(entry.name, entry.path, entry.type, clickable ? () => {
+          state.currentPath = entry.path;
+          loadFiles();
+        } : null);
+      }
+      if (!$("fileList").children.length) {
+        $("fileList").innerHTML = '<div class="empty">目录为空</div>';
+      }
+    }
+
+    function addFileRow(name, path, type, onClick) {
+      const row = document.createElement("div");
+      row.className = "file-row";
+      const mark = type === "directory" ? ">" : type === "blocked" ? "!" : "-";
+      row.innerHTML = `
+        <span class="muted">${mark}</span>
+        <button ${onClick ? "" : "disabled"}>${escapeHtml(name)}</button>
+        <span class="muted">${typeName(type)}</span>
+      `;
+      if (onClick) row.querySelector("button").onclick = onClick;
+      $("fileList").appendChild(row);
+    }
+
+    async function loadTasks() {
+      const data = await api("/api/tasks?limit=80");
+      const tasks = data.tasks || [];
+      const queued = data.queued || [];
+      const running = tasks.filter((t) => t.status === "running").length;
+      $("taskStatus").textContent = `${running} 运行中 · ${queued.length} 排队`;
+      $("taskList").innerHTML = "";
+      for (const item of queued) {
+        addTaskItem({
+          task_id: item.queue_id,
+          status: "queued",
+          project_alias: item.project_alias,
+          prompt: item.prompt,
+          created_at: item.queued_at,
+        }, false);
+      }
+      for (const task of tasks) addTaskItem(task, true);
+      if (!$("taskList").children.length) {
+        $("taskList").innerHTML = '<div class="empty">暂无任务</div>';
+      }
+    }
+
+    function addTaskItem(task, selectable) {
+      const div = document.createElement("div");
+      div.className = `item ${task.task_id === state.currentTask ? "active" : ""}`;
+      div.innerHTML = `
+        <div class="item-title">
+          <span>${escapeHtml(task.project_alias || "-")}</span>
+          <span class="${statusClass(task.status)}">${escapeHtml(task.status || "-")}</span>
+        </div>
+        <div class="item-meta">${escapeHtml(taskTitle(task))}</div>
+        <div class="item-meta">${escapeHtml(task.task_id || "")}</div>
+      `;
+      if (selectable) div.onclick = () => selectTask(task.task_id);
+      $("taskList").appendChild(div);
+    }
+
+    async function selectTask(taskId) {
+      state.currentTask = taskId;
+      await loadTaskDetail();
+      await loadTasks();
+    }
+
+    async function loadTaskDetail() {
+      if (!state.currentTask) return;
+      const data = await api(`/api/tasks/${encodeURIComponent(state.currentTask)}`);
+      const task = data.task;
+      $("taskDetail").className = "notice";
+      $("taskDetail").innerHTML = `
+        <strong>${escapeHtml(task.project_alias || "-")} · ${escapeHtml(task.status || "-")}</strong><br>
+        任务：${escapeHtml(task.prompt || "未记录")}<br>
+        创建：${escapeHtml(task.created_at || "-")}<br>
+        结束：${escapeHtml(task.finished_at || "-")}<br>
+        风险处理：${escapeHtml(task.risk_action || "-")}<br>
+        摘要：${escapeHtml(data.summary || "暂无摘要")}
+      `;
+      $("logView").textContent = data.log_tail || "暂无日志";
+    }
+
+    async function startTask() {
+      const project = $("projectSelect").value;
+      const prompt = $("promptInput").value.trim();
+      if (!project || !prompt) {
+        setText("startResult", "请选择项目并填写任务内容。");
+        return;
+      }
+      $("startBtn").disabled = true;
+      setText("startResult", "正在创建任务...");
+      try {
+        const data = await api("/api/tasks", {
+          method: "POST",
+          body: JSON.stringify({ project, prompt }),
+        });
+        setText("startResult", data.reply || "任务已提交。");
+        if (data.task_id) {
+          $("promptInput").value = "";
+          await selectTask(data.task_id);
+        }
+        await loadTasks();
+      } catch (error) {
+        setText("startResult", error.message);
+      } finally {
+        $("startBtn").disabled = false;
+      }
+    }
+
+    async function stopTask() {
+      if (!state.currentTask) return;
+      const data = await api(`/api/tasks/${encodeURIComponent(state.currentTask)}/stop`, { method: "POST" });
+      setText("startResult", data.reply || "已发送停止请求。");
+      await loadTaskDetail();
+      await loadTasks();
+    }
+
+    async function refreshAll() {
+      try {
+        await loadHealth();
+        await loadProjects();
+        await loadTasks();
+        if (state.currentTask) await loadTaskDetail();
+      } catch (error) {
+        setText("healthText", error.message);
+      }
+    }
+
+    function saveToken() {
+      state.token = $("tokenInput").value.trim();
+      localStorage.setItem("codex_web_token", state.token);
+      document.cookie = `codex_web_token=${encodeURIComponent(state.token)}; SameSite=Lax`;
+      refreshAll();
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "").replace(/[&<>"']/g, (ch) => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;",
+      }[ch]));
+    }
+
+    function typeName(type) {
+      return {
+        directory: "目录",
+        file: "文件",
+        blocked: "越权",
+        other: "其他",
+      }[type] || type;
+    }
+
+    $("tokenInput").value = state.token;
+    $("saveTokenBtn").onclick = saveToken;
+    $("refreshBtn").onclick = refreshAll;
+    $("startBtn").onclick = startTask;
+    $("stopBtn").onclick = stopTask;
+    $("logBtn").onclick = loadTaskDetail;
+    $("projectSelect").onchange = () => selectProject($("projectSelect").value);
+    refreshAll();
+    state.poll = setInterval(() => {
+      if (state.token) {
+        loadTasks().then(() => state.currentTask ? loadTaskDetail() : null).catch(() => {});
+      }
+    }, 5000);
+  </script>
+</body>
+</html>

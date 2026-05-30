@@ -11,11 +11,13 @@ import os
 import re
 import secrets
 import signal
+import socket
 import socketserver
 import subprocess
 import threading
 import time
 import traceback
+import urllib.parse
 import urllib.error
 import urllib.request
 from collections import Counter
@@ -269,10 +271,15 @@ class Config:
         self.feishu = raw.get("feishu", {})
         self.codex = raw.get("codex", {})
         self.security = raw.get("security", {})
+        self.web = raw.get("web", {})
         self.projects = raw.get("projects", {})
 
         self.host = self.server.get("host", "127.0.0.1")
         self.port = int(self.server.get("port", 8787))
+        self.web_enabled = bool(self.web.get("enabled", False))
+        self.web_host = self.web.get("host", self.host)
+        self.web_port = int(self.web.get("port", self.port))
+        self.web_auth_token = str(self.web.get("auth_token", ""))
         self.tasks_root = Path(expand_path(raw.get("tasks_root", "~/.codex_feishu_tasks")))
         self.event_mode = self.feishu.get("event_mode", "websocket")
         self.default_project_alias = raw.get("default_project_alias") or self.feishu.get("default_project_alias", "")
@@ -294,6 +301,11 @@ class Config:
         if not path:
             return None
         return Path(expand_path(path))
+
+    def http_bind(self) -> Tuple[str, int]:
+        if self.web_enabled:
+            return str(self.web_host), int(self.web_port)
+        return str(self.host), int(self.port)
 
 
 class FeishuClient:
@@ -472,6 +484,16 @@ class TaskManager:
                 continue
         items.sort(key=lambda x: x.get("created_at", ""), reverse=True)
         return items[:limit]
+
+    def get_task(self, task_id: str) -> Optional[Dict[str, Any]]:
+        return self._load_meta(task_id)
+
+    def queued_tasks(self) -> List[Dict[str, Any]]:
+        with self._queue_lock:
+            queued = [dict(task) for task in self.pending_queue]
+        for task in queued:
+            task.pop("_config", None)
+        return queued
 
     def _running_tasks(self) -> List[Dict[str, Any]]:
         items = []
@@ -1346,22 +1368,41 @@ def to_plain_dict(data: Any) -> Dict[str, Any]:
     return result
 
 
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+
 class RequestHandler(http.server.BaseHTTPRequestHandler):
     router: CommandRouter
     config: Config
+    tasks: TaskManager
     seen_event_ids: Dict[str, float] = {}
 
     def log_message(self, fmt: str, *args: Any) -> None:
         print(f"[{utc_now()}] {self.address_string()} {fmt % args}", flush=True)
 
     def do_GET(self) -> None:
-        if self.path == "/health":
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/health":
             self.send_json(200, {"ok": True, "time": utc_now()})
+            return
+        if parsed.path == "/" and self.config.web_enabled:
+            self._send_static_file("index.html")
+            return
+        if parsed.path.startswith("/api/"):
+            if not self._require_web_auth():
+                return
+            self._handle_api_get(parsed)
             return
         self.send_json(404, {"error": "not found"})
 
     def do_POST(self) -> None:
-        if self.path != "/feishu/events":
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path.startswith("/api/"):
+            if not self._require_web_auth():
+                return
+            self._handle_api_post(parsed)
+            return
+        if parsed.path != "/feishu/events":
             self.send_json(404, {"error": "not found"})
             return
         length = int(self.headers.get("Content-Length", "0"))
@@ -1397,6 +1438,182 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
         if msg:
             threading.Thread(target=self.router.handle_message, args=(msg,), daemon=True).start()
         self.send_json(200, {"code": 0})
+
+    def _handle_api_get(self, parsed: urllib.parse.ParseResult) -> None:
+        query = urllib.parse.parse_qs(parsed.query)
+        if parsed.path == "/api/health":
+            self._api_health()
+            return
+        if parsed.path == "/api/projects":
+            self._api_projects()
+            return
+        if parsed.path == "/api/files":
+            project = self._query_value(query, "project")
+            rel_path = self._query_value(query, "path")
+            self._api_files(project, rel_path)
+            return
+        if parsed.path == "/api/tasks":
+            self._api_tasks()
+            return
+        match = re.match(r"^/api/tasks/([^/]+)(?:/(log))?$", parsed.path)
+        if match:
+            task_id = urllib.parse.unquote(match.group(1))
+            if match.group(2) == "log":
+                chars = self._query_int(query, "chars", 12000, 1000, 50000)
+                self._api_task_log(task_id, chars)
+            else:
+                self._api_task_detail(task_id)
+            return
+        self.send_json(404, {"error": "not found"})
+
+    def _handle_api_post(self, parsed: urllib.parse.ParseResult) -> None:
+        if parsed.path == "/api/tasks":
+            self._api_start_task()
+            return
+        match = re.match(r"^/api/tasks/([^/]+)/stop$", parsed.path)
+        if match:
+            self._api_stop_task(urllib.parse.unquote(match.group(1)))
+            return
+        self.send_json(404, {"error": "not found"})
+
+    def _api_health(self) -> None:
+        codex_bin = str(self.config.codex.get("bin", "/opt/homebrew/bin/codex"))
+        codex_path = Path(expand_path(codex_bin)) if codex_bin.startswith("~") else Path(codex_bin)
+        self.send_json(
+            200,
+            {
+                "ok": True,
+                "time": utc_now(),
+                "hostname": socket.gethostname(),
+                "computer_name": self._computer_name(),
+                "codex_bin": codex_bin,
+                "codex_exists": codex_path.exists(),
+                "codex_executable": os.access(codex_path, os.X_OK),
+                "tasks_root": str(self.config.tasks_root),
+                "web": {
+                    "enabled": self.config.web_enabled,
+                    "host": self.config.web_host,
+                    "port": self.config.web_port,
+                },
+            },
+        )
+
+    def _api_projects(self) -> None:
+        projects = []
+        for alias in sorted(self.config.projects.keys()):
+            path = self.config.project_path(alias)
+            projects.append(
+                {
+                    "alias": alias,
+                    "path": str(path) if path else "",
+                    "exists": bool(path and path.is_dir()),
+                    "is_default": alias == self.config.default_project_alias,
+                }
+            )
+        self.send_json(200, {"projects": projects, "default_project_alias": self.config.default_project_alias})
+
+    def _api_files(self, project_alias: str, rel_path: str) -> None:
+        root = self._project_root(project_alias)
+        if not root:
+            self.send_json(404, {"error": "未知项目或目录不可用"})
+            return
+        target, error = self._safe_project_path(root, rel_path)
+        if error:
+            self.send_json(400, {"error": error})
+            return
+        if not target.exists():
+            self.send_json(404, {"error": "路径不存在"})
+            return
+        if not target.is_dir():
+            self.send_json(400, {"error": "只能浏览目录"})
+            return
+
+        entries = []
+        try:
+            children = sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+        except PermissionError:
+            self.send_json(403, {"error": "没有权限读取该目录"})
+            return
+        for child in children:
+            allowed = self._is_under_root(root, child.resolve(strict=False))
+            entry_path = self._display_relative_to_root(root, child)
+            stat = None
+            try:
+                stat = child.stat()
+            except OSError:
+                pass
+            entries.append(
+                {
+                    "name": child.name,
+                    "path": entry_path,
+                    "type": self._entry_type(child, allowed),
+                    "is_symlink": child.is_symlink(),
+                    "size": stat.st_size if stat else None,
+                    "modified_at": int(stat.st_mtime) if stat else None,
+                    "allowed": allowed,
+                }
+            )
+        self.send_json(
+            200,
+            {
+                "project": project_alias,
+                "root": str(root),
+                "path": self._relative_to_root(root, target),
+                "parent": self._relative_to_root(root, target.parent) if target != root else "",
+                "entries": entries,
+            },
+        )
+
+    def _api_tasks(self) -> None:
+        limit = self._query_int(urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query), "limit", 50, 1, 200)
+        self.send_json(200, {"tasks": self.tasks.list_tasks(limit=limit), "queued": self.tasks.queued_tasks()})
+
+    def _api_task_detail(self, task_id: str) -> None:
+        meta = self.tasks.get_task(task_id)
+        if not meta:
+            self.send_json(404, {"error": "未找到任务"})
+            return
+        self.send_json(
+            200,
+            {
+                "task": meta,
+                "summary": self.tasks._finished_summary(task_id),
+                "log_tail": tail_text(self.tasks._log_path(task_id), 12000),
+            },
+        )
+
+    def _api_task_log(self, task_id: str, chars: int) -> None:
+        meta = self.tasks.get_task(task_id)
+        if not meta:
+            self.send_json(404, {"error": "未找到任务"})
+            return
+        self.send_json(200, {"task_id": task_id, "log": tail_text(self.tasks._log_path(task_id), chars)})
+
+    def _api_start_task(self) -> None:
+        data = self._read_json_body()
+        if data is None:
+            return
+        project_alias = str(data.get("project") or "").strip()
+        prompt = str(data.get("prompt") or "").strip()
+        if not project_alias:
+            self.send_json(400, {"error": "缺少项目别名"})
+            return
+        if not prompt:
+            self.send_json(400, {"error": "缺少任务内容"})
+            return
+        reply = self.tasks.start(project_alias, prompt, "", "web")
+        task_id = self._extract_task_id(reply)
+        status = "queued"
+        if reply.startswith("已拒绝"):
+            status = "rejected"
+        elif task_id:
+            status = "started"
+        self.send_json(200, {"reply": reply, "task_id": task_id, "status": status})
+
+    def _api_stop_task(self, task_id: str) -> None:
+        reply = self.tasks.stop(task_id)
+        code = 200 if not reply.startswith("未找到任务") else 404
+        self.send_json(code, {"reply": reply})
 
     def _is_challenge(self, payload: Dict[str, Any]) -> bool:
         return payload.get("type") == "url_verification" or "challenge" in payload
@@ -1434,35 +1651,179 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
         raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
         self.wfile.write(raw)
+
+    def _send_static_file(self, name: str) -> None:
+        path = (STATIC_DIR / name).resolve()
+        if not self._is_under_root(STATIC_DIR.resolve(), path) or not path.is_file():
+            self.send_json(404, {"error": "not found"})
+            return
+        raw = path.read_bytes()
+        content_type = "text/html; charset=utf-8" if path.suffix == ".html" else "application/octet-stream"
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def _require_web_auth(self) -> bool:
+        if not self.config.web_enabled:
+            self.send_json(404, {"error": "Web 控制台未启用"})
+            return False
+        expected = self.config.web_auth_token
+        if not expected:
+            self.send_json(503, {"error": "未配置 web.auth_token，Web API 已关闭"})
+            return False
+        got = self.headers.get("X-Web-Token", "").strip()
+        auth = self.headers.get("Authorization", "").strip()
+        if auth.lower().startswith("bearer "):
+            got = auth[7:].strip()
+        if not got:
+            got = self._cookie_value("codex_web_token")
+        if got and safe_compare(got, expected):
+            return True
+        self.send_json(401, {"error": "未授权，请提供 Web 控制台 token"})
+        return False
+
+    def _cookie_value(self, name: str) -> str:
+        raw = self.headers.get("Cookie", "")
+        for part in raw.split(";"):
+            key, _, value = part.strip().partition("=")
+            if key == name:
+                return urllib.parse.unquote(value)
+        return ""
+
+    def _read_json_body(self) -> Optional[Dict[str, Any]]:
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length)
+        try:
+            data = json.loads(raw.decode("utf-8") if raw else "{}")
+        except Exception:
+            self.send_json(400, {"error": "请求体不是合法 JSON"})
+            return None
+        if not isinstance(data, dict):
+            self.send_json(400, {"error": "请求体必须是 JSON 对象"})
+            return None
+        return data
+
+    def _project_root(self, alias: str) -> Optional[Path]:
+        path = self.config.project_path(alias)
+        if not path or not path.is_dir():
+            return None
+        return path.resolve()
+
+    def _safe_project_path(self, root: Path, rel_path: str) -> Tuple[Path, Optional[str]]:
+        rel_path = urllib.parse.unquote(str(rel_path or "")).strip()
+        candidate = Path(rel_path)
+        if candidate.is_absolute():
+            return root, "不允许使用绝对路径"
+        target = (root / candidate).resolve(strict=False)
+        if not self._is_under_root(root, target):
+            return root, "路径越过项目根目录，已拒绝"
+        return target, None
+
+    def _is_under_root(self, root: Path, target: Path) -> bool:
+        try:
+            os.path.commonpath([str(root.resolve()), str(target.resolve(strict=False))])
+        except (OSError, ValueError):
+            return False
+        return os.path.commonpath([str(root.resolve()), str(target.resolve(strict=False))]) == str(root.resolve())
+
+    def _relative_to_root(self, root: Path, path: Path) -> str:
+        try:
+            rel = path.resolve(strict=False).relative_to(root.resolve())
+        except ValueError:
+            return ""
+        return "" if str(rel) == "." else str(rel)
+
+    def _display_relative_to_root(self, root: Path, path: Path) -> str:
+        try:
+            rel = path.relative_to(root)
+        except ValueError:
+            return self._relative_to_root(root, path)
+        return "" if str(rel) == "." else str(rel)
+
+    def _entry_type(self, path: Path, allowed: bool) -> str:
+        if not allowed:
+            return "blocked"
+        if path.is_dir():
+            return "directory"
+        if path.is_file():
+            return "file"
+        return "other"
+
+    def _query_value(self, query: Dict[str, List[str]], name: str) -> str:
+        values = query.get(name) or [""]
+        return values[0]
+
+    def _query_int(self, query: Dict[str, List[str]], name: str, default: int, minimum: int, maximum: int) -> int:
+        try:
+            value = int(self._query_value(query, name) or default)
+        except ValueError:
+            value = default
+        return max(minimum, min(maximum, value))
+
+    def _extract_task_id(self, text: str) -> Optional[str]:
+        match = re.search(r"任务:\s*([0-9]{8}-[0-9]{6}-[a-f0-9]+)", text)
+        return match.group(1) if match else None
+
+    def _computer_name(self) -> str:
+        try:
+            completed = subprocess.run(
+                ["scutil", "--get", "ComputerName"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+        except Exception:
+            return ""
+        return completed.stdout.strip()
 
 
 class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
 
 
-def build_server(config: Config) -> ThreadingHTTPServer:
+def build_components(config: Config) -> Tuple[FeishuClient, TaskManager, CommandRouter]:
     feishu = FeishuClient(config)
     tasks = TaskManager(config, feishu)
     router = CommandRouter(config, tasks, feishu)
+    return feishu, tasks, router
+
+
+def build_server(
+    config: Config,
+    tasks: Optional[TaskManager] = None,
+    router: Optional[CommandRouter] = None,
+) -> ThreadingHTTPServer:
+    if tasks is None or router is None:
+        _, tasks, router = build_components(config)
     RequestHandler.config = config
     RequestHandler.router = router
-    return ThreadingHTTPServer((config.host, config.port), RequestHandler)
+    RequestHandler.tasks = tasks
+    host, port = config.http_bind()
+    return ThreadingHTTPServer((host, port), RequestHandler)
 
 
 def build_router(config: Config) -> CommandRouter:
-    feishu = FeishuClient(config)
-    tasks = TaskManager(config, feishu)
-    return CommandRouter(config, tasks, feishu)
+    _, _, router = build_components(config)
+    return router
 
 
 def run_http(config: Config) -> None:
     server = build_server(config)
-    print(f"Codex 飞书控制服务已启动: http://{config.host}:{config.port}", flush=True)
+    host, port = config.http_bind()
+    print(f"Codex 飞书控制服务已启动: http://{host}:{port}", flush=True)
     print(f"配置文件: {config.config_path}", flush=True)
     print(f"任务目录: {config.tasks_root}", flush=True)
+    if config.web_enabled:
+        print(f"Web 控制台: http://{host}:{port}", flush=True)
     print(f"完成通知合并窗口: {config.finish_summary_window} 秒", flush=True)
     try:
         server.serve_forever()
@@ -1482,7 +1843,14 @@ def run_websocket(config: Config) -> None:
     except ImportError as exc:
         raise RuntimeError("长连接模式需要安装官方 SDK：python3 -m pip install lark-oapi -U") from exc
 
-    router = build_router(config)
+    _, tasks, router = build_components(config)
+    web_server: Optional[ThreadingHTTPServer] = None
+    if config.web_enabled:
+        web_server = build_server(config, tasks=tasks, router=router)
+        web_thread = threading.Thread(target=web_server.serve_forever, name="web-console", daemon=True)
+        web_thread.start()
+        host, port = config.http_bind()
+        print(f"Web 控制台已启动: http://{host}:{port}", flush=True)
 
     def on_message(data: Any) -> None:
         msg = parse_ws_message(data)
@@ -1507,7 +1875,12 @@ def run_websocket(config: Config) -> None:
     print(f"配置文件: {config.config_path}", flush=True)
     print(f"任务目录: {config.tasks_root}", flush=True)
     print(f"完成通知合并窗口: {config.finish_summary_window} 秒", flush=True)
-    client.start()
+    try:
+        client.start()
+    finally:
+        if web_server:
+            web_server.shutdown()
+            web_server.server_close()
 
 
 def main(argv: Optional[List[str]] = None) -> int:
