@@ -66,6 +66,18 @@ for pid in $pids; do
     continue
   fi
 
+  command_line="$("$PS_BIN" -p "$pid" -o command= 2>/dev/null || true)"
+  case "$command_line" in
+    *"pgrep -f codex exec"*|*"pgrep -fl codex exec"*)
+      continue
+      ;;
+    *"codex exec"*)
+      ;;
+    *)
+      continue
+      ;;
+  esac
+
   process_count=$((process_count + 1))
   if [ -z "$pid_list" ]; then
     pid_list="$pid"
