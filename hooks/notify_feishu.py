@@ -7,6 +7,7 @@ import json
 import os
 import platform
 import socket
+import ssl
 import sys
 import time
 import traceback
@@ -34,6 +35,7 @@ DEFAULT_TOOL_FAILURE_MIN_INTERVAL_SECONDS = 300
 DEFAULT_STOP_SETTLE_SECONDS = 2
 DEFAULT_STOP_COMPLETION_LOOKBACK_SECONDS = 5
 DEFAULT_NOTIFY_PREFIX = "【Codex-mini】"
+FEISHU_REQUEST_RETRIES = 3
 
 
 def now_local() -> str:
@@ -917,13 +919,27 @@ def post_json(url: str, payload: dict, headers: dict | None = None, timeout: int
     if headers:
         request_headers.update(headers)
     req = urllib.request.Request(url, data=body, headers=request_headers, method="POST")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with urlopen_with_retry(req, timeout=timeout) as resp:
         raw = resp.read().decode("utf-8", errors="replace")
         try:
             parsed = json.loads(raw) if raw else {}
         except json.JSONDecodeError:
             parsed = raw
         return resp.status, parsed
+
+
+def urlopen_with_retry(req: urllib.request.Request, timeout: int):
+    for attempt in range(1, FEISHU_REQUEST_RETRIES + 1):
+        try:
+            return urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError:
+            raise
+        except (urllib.error.URLError, TimeoutError, ConnectionError, ssl.SSLError, OSError) as exc:
+            if attempt >= FEISHU_REQUEST_RETRIES:
+                raise
+            write_log("warning", "feishu request retrying", attempt=attempt, error=str(exc))
+            time.sleep(min(2.0, 0.4 * attempt))
+    raise RuntimeError("unreachable")
 
 
 def send_feishu_webhook(webhook_url: str, text: str, timeout: int) -> bool:
@@ -938,7 +954,7 @@ def send_feishu_webhook(webhook_url: str, text: str, timeout: int) -> bool:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urlopen_with_retry(req, timeout=timeout) as resp:
             body = resp.read().decode("utf-8", errors="replace")
             ok = 200 <= resp.status < 300
             write_log("info" if ok else "error", "feishu webhook response", status=resp.status, body=body[:MAX_FIELD_LEN])
