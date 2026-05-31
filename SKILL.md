@@ -33,6 +33,7 @@ allowed-tools: Bash, Read, Write, Glob
 人工接管通知（核心价值）：
 - 进展通知：任务运行超过阈值（默认30分钟）且输出有实质变化时推送摘要，内容无变化自动跳过避免重复打扰
 - 完成通知：任务成功、失败、超时、被停止时推送结果摘要
+- cron 进度巡检：`~/.codex/hooks/progress_check.sh` 每30分钟检查 `codex exec` 进程；有任务运行时推送设备、已运行时长和进程数，无任务时静默退出
 - 完成通知合并：60秒窗口内多个任务完成合并为一条推送，单条任务显示详细摘要，多条显示批量汇总
 - 全局 Hook 完成通知优化：去掉 CST 等时区缩写，`cwd=/` 时从 transcript 或当前工作区推断真实目录，并显示当前任务描述
 - 工具异常静默处理：PostToolUse 不再推送“工具异常”提醒，避免 timeout 等工具输出关键词造成打扰
@@ -80,13 +81,38 @@ feishu 块：
 - dry_run 默认true：true 时只打印不实际发送，调试用
 
 ## 快速部署
-git clone https://github.com/yourname/codex-feishu-control.git
+git clone https://github.com/happy7blue/codex-feishu-control.git
 cd codex-feishu-control
 cp config.example.json config.json
 填写 feishu.app_id、app_secret 和 projects 路径，将 dry_run 改为 false
 cp launch_agents/com.swq.codex-feishu-control.plist ~/Library/LaunchAgents/
 launchctl load ~/Library/LaunchAgents/com.swq.codex-feishu-control.plist
 在飞书发送"帮助"验证连通
+
+## Hooks + cron 部署
+
+全局 Codex Hook 与定时进度巡检部署到 `~/.codex/hooks/`，复用同一个 `feishu.env` 凭据文件和 `notify_feishu.py` 发送逻辑：
+
+```bash
+mkdir -p ~/.codex/hooks ~/.codex/logs
+install -m 700 hooks/notify_feishu.py ~/.codex/hooks/notify_feishu.py
+install -m 700 hooks/progress_check.sh ~/.codex/hooks/progress_check.sh
+chmod 600 ~/.codex/hooks/feishu.env
+```
+
+`progress_check.sh` 的默认设备名是 `Mini 2`，也可通过 `CODEX_PROGRESS_DEVICE_NAME` 覆盖。脚本使用 `pgrep -f "codex exec"` 检测正在运行的 Codex CLI 任务；没有进程时不输出、不推送，有进程时推送：
+
+- 设备名
+- 已运行时长（取最长运行中的 `codex exec` 进程）
+- 进程数和 PID 列表
+
+注册 cron，每30分钟执行一次：
+
+```bash
+*/30 * * * * /Users/rex/.codex/hooks/progress_check.sh # codex-progress-check
+```
+
+部署后用 `crontab -l | grep codex-progress-check` 确认条目存在。脚本日志写入 `~/.codex/logs/progress_check.log`；飞书发送结果沿用 `~/.codex/logs/notify_feishu.log`。
 
 详细配置步骤见 references/setup-guide.md，token 获取方式见 references/token-validation.md。
 
