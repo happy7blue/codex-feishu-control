@@ -2,7 +2,10 @@ config.json
 __pycache__/
 *.pyc
 .env
+*.env
 *.log
+backups/
 hooks/feishu.env
 hooks/feishu.env.*
 hooks/*.bak.*
+*.bak

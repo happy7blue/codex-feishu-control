@@ -47,6 +47,11 @@ allowed-tools: Bash, Read, Write, Glob
 
 安全存储：凭据权限 600 存储，所有日志自动脱敏，token 不会出现在任务输出中。
 
+运行依赖：
+- Hook、notify 和 cron 飞书通知部署后在本机用 Python / Bash 运行，不调用大模型
+- 只有通过后台守护进程创建新的 Codex 任务时，`codex exec` 才会使用 Codex 背后的模型
+- 飞书通知链路只依赖本机事件、Python 3、飞书凭据和网络
+
 ## 推送消息格式
 
 进展通知：
@@ -120,3 +125,4 @@ chmod 600 ~/.codex/hooks/feishu.env
 - 不支持交互式 approve/reject，高风险任务只能进入只读计划或拒绝
 - 不支持 pty，Codex 通过非交互 codex exec 运行
 - 飞书发送失败不阻塞任务完成，异常写入任务日志
+- 不提交 `config.json`、`hooks/feishu.env`、备份文件、日志、Webhook、App Secret、tenant token 或真实 receive_id
