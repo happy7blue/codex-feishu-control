@@ -22,12 +22,22 @@
 
 ## 主要能力
 
-- Codex 任务完成通知：处理 `Stop` / `turn-ended`，并对重复完成推送做短窗口去重。
-- 需要确认通知：处理 `PermissionRequest`，这类重要事件不受普通完成通知静默窗口影响。
+- Codex 任务完成通知：处理正式 `Stop` Hook，并对重复完成推送做短窗口去重。
+- 需要确认通知：处理真正交给用户的 `PermissionRequest`；内部 `auto_review` 自动审批不会推送。
 - 人工介入通知：当最终回复显示卡住、需要确认或无法继续时推送提醒。
 - cron 进度巡检：`hooks/progress_check.sh` 可定时检查 `codex exec` 进程，有任务运行时推送设备、已运行时长和进程数。
 - mini-monitor 兼容：保留 `CodexMonitorComplete`、`CodexMonitorTimeout`、`CodexMonitorStuck` 等事件识别。
 - 安全存储：真实凭据只放本机配置文件，日志和示例文件不应包含 token、Webhook、App Secret 或真实 `open_id`。
+
+## 通知判定与去重
+
+- 自动审批器 `auto_review` 处理的 `PermissionRequest` 不会冒充用户确认通知。
+- 真正的用户审批保留首次即时提醒；同一回合、同一工具默认 5 分钟内不重复推送。
+- 普通 `Stop` 只有在同一 `transcript_path + turn_id` 中找到 `task_complete` 后才会显示“任务完成”。
+- `last_assistant_message` 只用于摘要，不作为完成证据，也不会跨会话寻找完成记录。
+- legacy `notify` / `turn-ended` 载荷不能转换成 `Stop`；飞书脚本只应接收正式 Hook 事件。
+
+审批通知限频时间可通过 `FEISHU_PERMISSION_MIN_INTERVAL_SECONDS` 调整；设为 `0` 可关闭限频。缺少同回合完成证据时，完成通知会静默而不是猜测任务已经结束。
 
 ## 快速部署 Hook 通知
 

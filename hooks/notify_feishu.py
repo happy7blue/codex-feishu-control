@@ -31,6 +31,7 @@ TASK_SUMMARY_LEN = 30
 DEFAULT_FEISHU_API_BASE = "https://open.feishu.cn/open-apis"
 DEFAULT_STOP_MIN_INTERVAL_SECONDS = 10
 DEFAULT_ROOT_STOP_DUPLICATE_WINDOW_SECONDS = 10
+DEFAULT_PERMISSION_MIN_INTERVAL_SECONDS = 300
 DEFAULT_TOOL_FAILURE_MIN_INTERVAL_SECONDS = 300
 DEFAULT_STOP_SETTLE_SECONDS = 2
 DEFAULT_STOP_COMPLETION_LOOKBACK_SECONDS = 5
@@ -162,6 +163,62 @@ def cwd_from_transcript(path_value: str) -> str:
     return ""
 
 
+def approval_context_from_transcript(path_value: str, turn_id: str = "") -> tuple[str, str]:
+    if not path_value:
+        return "", ""
+    try:
+        path = Path(path_value).expanduser().resolve()
+        codex_home = CODEX_HOME.expanduser().resolve()
+        if codex_home not in path.parents and path != codex_home:
+            return "", ""
+        if not path.exists() or not path.is_file():
+            return "", ""
+        max_bytes = 1024 * 1024
+        with path.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - max_bytes), os.SEEK_SET)
+            raw = fh.read().decode("utf-8", errors="replace")
+        for line in reversed(raw.splitlines()):
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(row, dict) or row.get("type") != "turn_context":
+                continue
+            payload = row.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            row_turn_id = str(payload.get("turn_id") or "")
+            if turn_id and row_turn_id and row_turn_id != turn_id:
+                continue
+            reviewer = str(payload.get("approvals_reviewer") or "").strip()
+            policy = str(payload.get("approval_policy") or "").strip()
+            return reviewer, policy
+    except Exception as exc:
+        write_log("debug", "failed to read transcript approval context", error=str(exc))
+    return "", ""
+
+
+def permission_review_context(data: dict) -> tuple[str, str]:
+    reviewer = str(data.get("approvals_reviewer") or "").strip()
+    policy = str(data.get("approval_policy") or "").strip()
+    if reviewer or policy:
+        return reviewer, policy
+    transcript = data.get("transcript_path") or data.get("transcript")
+    if not isinstance(transcript, str):
+        return "", ""
+    return approval_context_from_transcript(transcript, str(data.get("turn_id") or ""))
+
+
+def is_auto_review_permission_request(data: dict) -> bool:
+    if data.get("hook_event_name") != "PermissionRequest":
+        return False
+    reviewer, _ = permission_review_context(data)
+    normalized = reviewer.lower().replace("-", "_")
+    return normalized in {"auto_review", "autoreview"}
+
+
 def latest_active_workspace_root() -> str:
     path = CODEX_HOME / ".codex-global-state.json"
     try:
@@ -212,7 +269,11 @@ def latest_prompt_history_task() -> str:
     return ""
 
 
-def completion_message_from_transcript(path_value: str, since_epoch: float) -> str:
+def completion_message_from_transcript(
+    path_value: str,
+    since_epoch: float,
+    expected_turn_id: str = "",
+) -> str:
     if not path_value:
         return ""
     try:
@@ -239,6 +300,9 @@ def completion_message_from_transcript(path_value: str, since_epoch: float) -> s
             payload_type = payload.get("type")
             row_epoch = timestamp_to_epoch(str(row.get("timestamp") or ""))
             if payload_type == "task_complete":
+                completed_turn_id = str(payload.get("turn_id") or "")
+                if expected_turn_id and completed_turn_id != expected_turn_id:
+                    continue
                 completed_at = payload.get("completed_at")
                 if isinstance(completed_at, (int, float)):
                     completed_epoch = float(completed_at)
@@ -247,48 +311,20 @@ def completion_message_from_transcript(path_value: str, since_epoch: float) -> s
                 if completed_epoch >= since_epoch:
                     return str(payload.get("last_agent_message") or "").strip()
                 return ""
-            if payload_type == "agent_message" and payload.get("phase") == "final_answer":
-                if row_epoch >= since_epoch:
-                    return str(payload.get("message") or "").strip()
     except Exception as exc:
         write_log("debug", "failed to read transcript completion evidence", error=str(exc))
     return ""
 
 
-def recent_completion_message(since_epoch: float) -> str:
-    sessions_dir = CODEX_HOME / "sessions"
-    if not sessions_dir.exists():
-        return ""
-    try:
-        candidates = []
-        for path in sessions_dir.rglob("*.jsonl"):
-            try:
-                mtime = path.stat().st_mtime
-            except OSError:
-                continue
-            if mtime >= since_epoch - 300:
-                candidates.append((mtime, path))
-        candidates.sort(reverse=True)
-        for _, path in candidates[:30]:
-            message = completion_message_from_transcript(str(path), since_epoch)
-            if message:
-                return message
-    except Exception as exc:
-        write_log("debug", "failed to scan recent completion evidence", error=str(exc))
-    return ""
-
-
 def completion_evidence_message(data: dict, since_epoch: float) -> str:
-    message = str(data.get("last_assistant_message") or "").strip()
-    if message:
-        return message
-
     transcript = data.get("transcript_path") or data.get("transcript")
-    message = completion_message_from_transcript(transcript, since_epoch) if isinstance(transcript, str) else ""
-    if message:
-        return message
-
-    return recent_completion_message(since_epoch)
+    if not isinstance(transcript, str):
+        return ""
+    return completion_message_from_transcript(
+        transcript,
+        since_epoch,
+        str(data.get("turn_id") or ""),
+    )
 
 
 def task_description(data: dict, limit: int = 100) -> str:
@@ -733,12 +769,58 @@ def state_key(data: dict, title: str, reason: str) -> str:
     return "|".join([event, title, reason or "-", cwd, tool])
 
 
+def permission_state_key(data: dict, title: str) -> str:
+    identity = "|".join(
+        [
+            str(data.get("session_id") or ""),
+            str(data.get("turn_id") or ""),
+            str(data.get("transcript_path") or data.get("transcript") or ""),
+            str(data.get("cwd") or ""),
+        ]
+    )
+    tool = str(data.get("tool_name") or data.get("tool") or "-")
+    return "|".join(["PermissionRequest", title, fingerprint(identity), tool, "-"])
+
+
 def should_skip_notification(data: dict, title: str, reason: str, env_values: dict) -> tuple[bool, str]:
     event = data.get("hook_event_name") or "Unknown"
     cwd = data.get("cwd") or ""
 
-    # Only throttle plain completion pushes. Approval and human-intervention
-    # alerts must stay immediate.
+    if event == "PermissionRequest":
+        if is_auto_review_permission_request(data):
+            return True, "skip PermissionRequest handled by auto_review"
+        interval = int_config(
+            env_values,
+            "FEISHU_PERMISSION_MIN_INTERVAL_SECONDS",
+            DEFAULT_PERMISSION_MIN_INTERVAL_SECONDS,
+            0,
+            86400,
+        )
+        if interval <= 0:
+            return False, ""
+        now = time.time()
+        key = permission_state_key(data, title)
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        lock_path = STATE_FILE.with_suffix(".lock")
+        with lock_path.open("a+") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                state = json.loads(STATE_FILE.read_text(encoding="utf-8")) if STATE_FILE.exists() else {}
+            except Exception as exc:
+                write_log("warning", "failed to read notify state; resetting", error=str(exc))
+                state = {}
+            last = float(state.get(key, 0) or 0)
+            if last and now - last < interval:
+                return True, f"skip repeated PermissionRequest within {interval}s"
+            cutoff = now - 86400
+            state = {k: v for k, v in state.items() if isinstance(v, (int, float)) and v >= cutoff}
+            state[key] = now
+            tmp = STATE_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(STATE_FILE)
+            return False, ""
+
+    # Plain completion pushes have their own short duplicate window.
     if event != "Stop" or title != "Codex 任务完成":
         return False, ""
 
