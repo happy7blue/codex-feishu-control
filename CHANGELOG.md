@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-07-26
+
+### Fixed
+
+- 抑制由 `auto_review` 自动处理的 `PermissionRequest` 飞书通知，避免每次需要内部审批的 Bash 调用都打扰用户。
+- 对真正的用户审批按 `session_id + turn_id + tool_name` 增加默认 5 分钟限频，并用文件锁避免并发重复发送。
+- `Stop` 完成通知只接受同一 transcript、同一 turn 的 `task_complete`；移除 `last_assistant_message` 和跨会话扫描作为完成证据的逻辑。
+- 明确 legacy `notify` 载荷不能伪装成 `Stop`，避免过程消息提前触发“Codex 任务完成”。
+
+### Validation
+
+- 覆盖自动审批静默、真实审批限频、跨回合完成证据隔离和过程消息拒绝四类回归场景。
+
 ## 2026-06-19
 
 ### Added
