@@ -114,7 +114,7 @@ chmod 600 ~/.codex/hooks/feishu.env
 注册 cron，每30分钟执行一次：
 
 ```bash
-*/30 * * * * /Users/rex/.codex/hooks/progress_check.sh # codex-progress-check
+*/30 * * * * $HOME/.codex/hooks/progress_check.sh # codex-progress-check
 ```
 
 部署后用 `crontab -l | grep codex-progress-check` 确认条目存在。脚本日志写入 `~/.codex/logs/progress_check.log`；飞书发送结果沿用 `~/.codex/logs/notify_feishu.log`。
