@@ -88,7 +88,7 @@ CODEX_PROGRESS_DEVICE_NAME="Mac mini" ~/.codex/hooks/progress_check.sh
 注册 cron，每 30 分钟检查一次：
 
 ```bash
-*/30 * * * * CODEX_PROGRESS_DEVICE_NAME="Mac mini" /Users/rex/.codex/hooks/progress_check.sh # codex-progress-check
+*/30 * * * * CODEX_PROGRESS_DEVICE_NAME="Mac mini" $HOME/.codex/hooks/progress_check.sh # codex-progress-check
 ```
 
 没有 `codex exec` 进程时脚本静默退出；有进程时会通过 `notify_feishu.py` 推送进度。
