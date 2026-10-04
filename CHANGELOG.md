@@ -32,5 +32,5 @@
 
 ### Notes
 
-- Mac mini 本地应继续将 `feishu.env` 保存在 `/Users/rex/.codex/hooks/feishu.env`，并保持 `600` 权限。
+- Mac mini 本地应继续将 `feishu.env` 保存在 `$HOME/.codex/hooks/feishu.env`，并保持 `600` 权限。
 - 验收覆盖完成、超时和卡住三种通知，均以飞书接口返回 `code: 0`、日志 `sent: true` 为准。
